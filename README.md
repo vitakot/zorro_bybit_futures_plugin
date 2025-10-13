@@ -1,4 +1,4 @@
-# Bybit Zorro Plugin
+# Bybit Futures Zorro Plugin
 Bybit Futures Plugin for Zorro Trader
 
 # Instructions
