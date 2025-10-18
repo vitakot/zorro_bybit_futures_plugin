@@ -12,6 +12,6 @@ include_directories(include bybit_cpp_api/include bybit_cpp_api/vk_cpp_common/in
 add_subdirectory(bybit_cpp_api)
 
 add_library(BybitFutures SHARED dllmain.cpp src/bybit_futures.cpp src/stdafx.cpp)
-target_compile_definitions(BybitFutures PUBLIC BYBIT_DLL_EXPORTS)
+target_compile_definitions(BybitFutures PUBLIC BYBIT_FUTURES_DLL_EXPORTS)
 
 target_link_libraries(BybitFutures PRIVATE spdlog::spdlog_header_only bybit_api)
