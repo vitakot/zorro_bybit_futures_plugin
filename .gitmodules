@@ -1,3 +1,3 @@
 [submodule "bybit_cpp_api"]
 	path = bybit_cpp_api
-	url = git@github.com:vitakot/bybit_cpp_api.git
+	url = git@github.com:StonkyLab/bybit-cpp-api.git
