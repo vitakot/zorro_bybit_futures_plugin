@@ -8,7 +8,7 @@ add_definitions(-D_WIN32_WINNT=0x0A00 /utf-8)
 
 find_package(spdlog CONFIG REQUIRED)
 
-include_directories(include bybit_cpp_api/include bybit_cpp_api/vk_cpp_common/include)
+include_directories(include bybit_cpp_api/include bybit_cpp_api/stonky-cpp-common/include)
 add_subdirectory(bybit_cpp_api)
 
 add_library(BybitFutures SHARED dllmain.cpp src/bybit_futures.cpp src/stdafx.cpp)
