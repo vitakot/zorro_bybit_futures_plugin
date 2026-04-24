@@ -7,10 +7,10 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stdafx.h"
-#include "vk/bybit/bybit_rest_client.h"
-#include "vk/bybit/bybit_ws_stream_manager.h"
-#include "vk/utils/utils.h"
-#include "vk/utils/registry.h"
+#include "stonky/bybit/bybit_rest_client.h"
+#include "stonky/bybit/bybit_ws_stream_manager.h"
+#include "stonky/utils/utils.h"
+#include "stonky/utils/registry.h"
 #include "bybit_futures.h"
 #include <wtypes.h>
 #include <string>
@@ -19,7 +19,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <algorithm>
 #include <fstream>
 
-#include "vk/bybit/bybit.h"
+#include "stonky/bybit/bybit.h"
 
 #define PLUGIN_VERSION    2
 #define PLUGIN_VERSION_STR "1.0.0"
@@ -31,7 +31,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #define OPEN_TRADES_FILE R"(./Data/bybit_open_trades.json)"
 
 using namespace std::chrono_literals;
-using namespace vk::bybit;
+using namespace stonky::bybit;
 
 static std::string currentSymbol;
 static std::string accountCurrency;
@@ -74,24 +74,24 @@ DLLFUNC_C int BrokerOpen(char *Name, FARPROC fpError, FARPROC fpProgress) {
 	return PLUGIN_VERSION;
 }
 
-void logFunction(const vk::LogSeverity severity, const std::string &errmsg) {
+void logFunction(const stonky::LogSeverity severity, const std::string &errmsg) {
 	switch (severity) {
-		case vk::LogSeverity::Info:
+		case stonky::LogSeverity::Info:
 			spdlog::info(errmsg);
 			break;
-		case vk::LogSeverity::Warning:
+		case stonky::LogSeverity::Warning:
 			spdlog::warn(errmsg);
 			break;
-		case vk::LogSeverity::Critical:
+		case stonky::LogSeverity::Critical:
 			spdlog::critical(errmsg);
 			break;
-		case vk::LogSeverity::Error:
+		case stonky::LogSeverity::Error:
 			spdlog::error(errmsg);
 			break;
-		case vk::LogSeverity::Debug:
+		case stonky::LogSeverity::Debug:
 			spdlog::debug(errmsg);
 			break;
-		case vk::LogSeverity::Trace:
+		case stonky::LogSeverity::Trace:
 			spdlog::trace(errmsg);
 			break;
 	}
@@ -139,7 +139,7 @@ void stopSymbolsUpdater() {
 }
 
 void writeBybitLastOrderId() {
-	if (const bool success = vk::writeInRegistry(HKEY_CURRENT_USER, ZORRO_REG_KEY, LAST_ORDER_ID_KEY, lastOrderId); !
+	if (const bool success = stonky::writeInRegistry(HKEY_CURRENT_USER, ZORRO_REG_KEY, LAST_ORDER_ID_KEY, lastOrderId); !
 		success) {
 		spdlog::error("Cannot store BybitLastOrderId");
 	}
@@ -147,7 +147,7 @@ void writeBybitLastOrderId() {
 
 void readBybitLastOrderId() {
 	DWORD bybitLastOrderId;
-	const bool success = vk::readDwordValueRegistry(HKEY_CURRENT_USER, ZORRO_REG_KEY, LAST_ORDER_ID_KEY,
+	const bool success = stonky::readDwordValueRegistry(HKEY_CURRENT_USER, ZORRO_REG_KEY, LAST_ORDER_ID_KEY,
 	                                           &bybitLastOrderId);
 	if (success) {
 		lastOrderId = static_cast<int>(bybitLastOrderId);
