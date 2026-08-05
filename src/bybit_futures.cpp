@@ -9,6 +9,9 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stdafx.h"
 #include "stonky/bybit/bybit_rest_client.h"
 #include "stonky/bybit/bybit_ws_stream_manager.h"
+/// NOTE: every Boost header must be included before bybit_futures.h - Zorro's trading.h defines the alternative
+/// operator tokens (and, or, not) as macros, which breaks Boost headers included after it.
+#include "stonky/bybit/bybit_http_session.h"
 #include "stonky/utils/utils.h"
 #include "stonky/utils/registry.h"
 #include "bybit_futures.h"
@@ -18,6 +21,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <spdlog/sinks/basic_file_sink.h>
 #include <algorithm>
 #include <fstream>
+#include <optional>
 
 #include "stonky/bybit/bybit.h"
 
@@ -33,13 +37,28 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 using namespace std::chrono_literals;
 using namespace stonky::bybit;
 
+/// Maximum time spent waiting for a price of an asset before the REST snapshot fallback kicks in
+static constexpr int STREAM_READ_TIMEOUT_S = 5;
+
+/// A cached quote older than this is considered unusable and is refreshed over REST. Must be generous enough for
+/// illiquid symbols whose top of book legitimately does not move for a long time.
+static constexpr int MAX_TICK_AGE_S = 60;
+
+/// Period of the background refresh of the instrument info (lot sizes, tick sizes, ...)
+static constexpr int INSTRUMENTS_UPDATE_PERIOD_S = 900;
+
+/// Bybit's order create response carries no status, it has to be queried. A resting or terminal state is normally
+/// known on the first poll.
+static constexpr int MAX_ORDER_POLL_ATTEMPTS = 10;
+static constexpr auto ORDER_POLL_INTERVAL = 250ms;
+
 static std::string currentSymbol;
 static std::string accountCurrency;
 static int lastOrderId = 0;
 static int orderType = 0;
 static double lotAmount = 1.0;
-static int loopMs = 50; // Actually unused
-static int waitMs = 30000; // Actually unused
+static int loopMs = 50; // Zorro loop time, kept for GET_DELAY only
+static int waitMs = STREAM_READ_TIMEOUT_S * 1000; // Maximum broker response time, drives the stream read timeout
 
 std::atomic symbolsUpdaterRunning = false;
 std::thread symbolsUpdater;
@@ -99,26 +118,21 @@ void logFunction(const stonky::LogSeverity severity, const std::string &errmsg) 
 
 void symbolsUpdaterFunc() {
 	symbolsUpdaterRunning = true;
-	int numPass = 60;
 
-	std::unique_ptr<RESTClient> restClientUpdater;
+	/// Refresh right away, then periodically. The instrument list covers the whole linear universe, downloading it
+	/// more often than the filters can realistically change is a waste of bandwidth and rate limit budget.
+	int numPass = INSTRUMENTS_UPDATE_PERIOD_S;
 
 	while (symbolsUpdaterRunning) {
-		if (numPass == 60) {
+		if (numPass >= INSTRUMENTS_UPDATE_PERIOD_S) {
 			numPass = 0;
 
 			try {
-				if (!restClientUpdater) {
-					restClientUpdater = std::make_unique<RESTClient>("", "");
-				}
-
-				if (restClientUpdater && restClient) {
-					restClient->setInstruments(restClientUpdater->getInstrumentsInfo(Category::linear, "", true));
+				if (restClient) {
+					static_cast<void>(restClient->getInstrumentsInfo(Category::linear, "", true));
 				}
 			} catch (std::exception &e) {
 				spdlog::error("{}: {}", MAKE_FILELINE, e.what());
-				spdlog::info("Resetting restClientUpdater, {}", MAKE_FILELINE);
-				restClientUpdater = std::make_unique<RESTClient>("", "");
 			}
 		}
 		std::this_thread::sleep_for(1s);
@@ -149,7 +163,7 @@ void readBybitLastOrderId() {
 	DWORD bybitLastOrderId;
 	const bool success = stonky::readDwordValueRegistry(HKEY_CURRENT_USER, ZORRO_REG_KEY, LAST_ORDER_ID_KEY,
 	                                           &bybitLastOrderId);
-	if (success) {
+	if (success && bybitLastOrderId != 0) {
 		lastOrderId = static_cast<int>(bybitLastOrderId);
 	} else {
 		time_t Time;
@@ -159,64 +173,85 @@ void readBybitLastOrderId() {
 	}
 }
 
-std::string findAssetForTradeId(int tradeId, bool erase = true) {
-	if (std::ifstream ifs(OPEN_TRADES_FILE); ifs.is_open()) {
-		nlohmann::json json;
-		json = nlohmann::json::parse(ifs);
-		ifs.close();
+/// Zorro identifies a trade by the id returned from BrokerBuy2, the exchange needs the symbol for every subsequent
+/// operation. The mapping is persisted so that it survives a Zorro restart.
+struct OpenTrade {
+	std::string asset;
+	int lots{0}; /// Remaining open lots, 0 for records written by older plugin versions
+};
 
-		if (auto it = json.find("openTrades"); it != json.end()) {
-			std::map<int, std::string> openTrades;
-			openTrades = it->get<std::map<int, std::string> >();
+/// Ids of recently closed trades, so that BrokerTrade can tell "fully closed" (-1) apart from "unknown" (NAY)
+static constexpr std::size_t MAX_CLOSED_TRADES = 200;
 
-			if (const auto tradeIt = openTrades.find(tradeId); tradeIt != openTrades.end()) {
-				auto retVal = tradeIt->second;
+struct TradeStore {
+	std::map<int, OpenTrade> open;
+	std::vector<int> closed; /// Oldest first, capped at MAX_CLOSED_TRADES
+};
 
-				if (erase) {
-					openTrades.erase(tradeIt);
+TradeStore loadTrades() {
+	TradeStore store;
 
-					json["openTrades"] = openTrades;
+	try {
+		std::ifstream ifs(OPEN_TRADES_FILE);
 
-					if (std::ofstream ofs(OPEN_TRADES_FILE); ofs.is_open()) {
-						ofs << json.dump(4);
-						ofs.close();
-					} else {
-						spdlog::error("Couldn't save json file, path: {}, {}", OPEN_TRADES_FILE, MAKE_FILELINE);
+		if (!ifs.is_open()) {
+			return store;
+		}
+
+		const nlohmann::json json = nlohmann::json::parse(ifs, nullptr, false);
+
+		if (json.is_discarded()) {
+			spdlog::error("Malformed json file, path: {}, {}", OPEN_TRADES_FILE, MAKE_FILELINE);
+			return store;
+		}
+
+		if (const auto it = json.find("openTrades"); it != json.end() && it->is_object()) {
+			for (const auto &[key, value]: it->items()) {
+				OpenTrade openTrade;
+
+				if (value.is_string()) {
+					/// Legacy format - the symbol was stored alone, the open size is unknown
+					openTrade.asset = value.get<std::string>();
+				} else if (value.is_object()) {
+					if (const auto assetIt = value.find("asset"); assetIt != value.end()) {
+						openTrade.asset = assetIt->get<std::string>();
+					}
+
+					if (const auto lotsIt = value.find("lots"); lotsIt != value.end()) {
+						openTrade.lots = lotsIt->get<int>();
 					}
 				}
 
-				return retVal;
+				if (!openTrade.asset.empty()) {
+					store.open.insert_or_assign(std::stoi(key), openTrade);
+				}
 			}
 		}
+
+		if (const auto it = json.find("closedTrades"); it != json.end() && it->is_array()) {
+			store.closed = it->get<std::vector<int> >();
+		}
+	} catch (std::exception &e) {
+		spdlog::error("{}: {}", MAKE_FILELINE, e.what());
 	}
-	spdlog::error("Could not find Asset for trade id: {}, {}", tradeId, MAKE_FILELINE);
-	return {};
+
+	return store;
 }
 
-void saveAssetForTradeId(const std::string &asset, int tradeId) {
+void saveTrades(const TradeStore &store) {
 	try {
-		std::ifstream ifs(OPEN_TRADES_FILE);
+		auto tradesJson = nlohmann::json::object();
+
+		for (const auto &[tradeId, openTrade]: store.open) {
+			tradesJson[std::to_string(tradeId)] = {{"asset", openTrade.asset}, {"lots", openTrade.lots}};
+		}
+
 		nlohmann::json json;
-		std::map<int, std::string> openTrades;
-
-		if (ifs.is_open()) {
-			json = nlohmann::json::parse(ifs);
-			ifs.close();
-		}
-
-		auto it = json.find("openTrades");
-
-		if (it != json.end()) {
-			openTrades = it->get<std::map<int, std::string> >();
-			openTrades.insert_or_assign(tradeId, asset);
-		} else {
-			openTrades.insert_or_assign(tradeId, asset);
-		}
-		json["openTrades"] = openTrades;
+		json["openTrades"] = tradesJson;
+		json["closedTrades"] = store.closed;
 
 		if (std::ofstream ofs(OPEN_TRADES_FILE); ofs.is_open()) {
 			ofs << json.dump(4);
-			ofs.close();
 		} else {
 			spdlog::error("Couldn't save json file, path: {}, {}", OPEN_TRADES_FILE, MAKE_FILELINE);
 		}
@@ -225,11 +260,76 @@ void saveAssetForTradeId(const std::string &asset, int tradeId) {
 	}
 }
 
+/// BrokerTrade is polled per open trade, so the store is kept in memory and only written through on a change
+static std::optional<TradeStore> tradeStoreCache;
+
+TradeStore &tradeStore() {
+	if (!tradeStoreCache) {
+		tradeStoreCache = loadTrades();
+	}
+
+	return *tradeStoreCache;
+}
+
+std::optional<OpenTrade> findOpenTrade(const int tradeId) {
+	const auto &store = tradeStore();
+
+	if (const auto it = store.open.find(tradeId); it != store.open.end()) {
+		return it->second;
+	}
+
+	spdlog::error("Could not find Asset for trade id: {}, {}", tradeId, MAKE_FILELINE);
+	return {};
+}
+
+bool wasTradeClosed(const int tradeId) {
+	const auto &store = tradeStore();
+	return std::ranges::find(store.closed, tradeId) != store.closed.end();
+}
+
+void storeOpenTrade(const int tradeId, const std::string &asset, const int lots) {
+	auto &store = tradeStore();
+	store.open.insert_or_assign(tradeId, OpenTrade{asset, lots});
+	saveTrades(store);
+}
+
+/**
+ * Account for lots that have just been closed. Once nothing is left open the record moves to the capped list of
+ * closed trades, which both keeps the file from growing forever and lets BrokerTrade report a closed trade.
+ * @param tradeId
+ * @param closedLots absolute number of closed lots
+ */
+void reduceOpenTrade(const int tradeId, const int closedLots) {
+	auto &store = tradeStore();
+	const auto it = store.open.find(tradeId);
+
+	if (it == store.open.end()) {
+		return;
+	}
+
+	if (const auto remaining = std::abs(it->second.lots) - std::abs(closedLots); remaining > 0) {
+		it->second.lots = it->second.lots < 0 ? -remaining : remaining;
+	} else {
+		store.open.erase(it);
+		store.closed.push_back(tradeId);
+
+		if (store.closed.size() > MAX_CLOSED_TRADES) {
+			store.closed.erase(store.closed.begin(),
+			                   store.closed.begin() + static_cast<long>(store.closed.size() - MAX_CLOSED_TRADES));
+		}
+	}
+
+	saveTrades(store);
+}
+
 DLLFUNC_C int BrokerLogin(char *User, char *Pwd, char *Type, char *Account) {
 	if (!User) {
 		stopSymbolsUpdater();
-		restClient.reset();
+		/// The stream manager holds a weak reference to the REST client, release it first
 		streamManager.reset();
+		restClient.reset();
+		/// Drop the cached trade store, it is re-read from disk on the next login
+		tradeStoreCache.reset();
 		spdlog::info("Logout");
 		spdlog::shutdown();
 		return 1;
@@ -270,6 +370,9 @@ DLLFUNC_C int BrokerLogin(char *User, char *Pwd, char *Type, char *Account) {
 		if (!streamManager) {
 			streamManager = std::make_unique<WSStreamManager>();
 			streamManager->setLoggerCallback(&logFunction);
+			streamManager->setRestClient(restClient);
+			streamManager->setTimeout(STREAM_READ_TIMEOUT_S);
+			streamManager->setMaxTickAge(MAX_TICK_AGE_S);
 		}
 	} catch (std::exception &e) {
 		spdlog::error("{}: {}", MAKE_FILELINE, e.what());
@@ -289,61 +392,99 @@ DLLFUNC_C int
 BrokerAsset(char *Asset, double *pPrice, double *pSpread, double *pVolume, double *pPip, double *pPipCost,
             double *pLotAmount, double *pMarginCost, double *pRollLong, double *pRollShort) {
 	/// NOTE: Do not log normal state, this function is called ver often!
-	if (!streamManager) {
+	if (!Asset || !*Asset) {
+		return 0;
+	}
+
+	if (!restClient || !streamManager) {
 		spdlog::critical("{}: {}", MAKE_FILELINE, "Bybit WS stream manager instance not initialized.");
 		return 0;
 	}
 
-	if (pPip != nullptr) {
+	/// Zorro subscribes an asset by calling with pPrice == NULL and only afterwards asks for prices
+	const bool subscribing = pPrice == nullptr;
+
+	if (pPip != nullptr || subscribing) {
+		/// Contract parameters of the asset
 		try {
-			const auto symbols = restClient->getInstrumentsInfo(Category::linear);
+			const auto instrument = restClient->getInstrumentInfo(Category::linear, Asset);
 
-			for (const auto &symbol: symbols) {
-				if (symbol.m_symbol == Asset) {
-					if (pLotAmount) {
-						*pLotAmount = symbol.m_lotSizeFilter.m_qtyStep;
-#ifdef _WIN64
-						lotAmounts.insert_or_assign(Asset, symbol.m_lotSizeFilter.m_qtyStep);
-#endif
-					}
-
-					*pPip = symbol.m_priceFilter.m_tickSize;
-
-					if (pPipCost && *pPip != 0.0 && *pLotAmount != 0.0) {
-						*pPipCost = *pPip * *pLotAmount;
-					}
-				}
+			if (!instrument) {
+				const auto msg = "Unknown asset: " + std::string(Asset);
+				spdlog::error("{}: {}", MAKE_FILELINE, msg);
+				BrokerError(msg.c_str());
+				return 0;
 			}
+
+			const auto tickSize = instrument->priceFilter.tickSize;
+			const auto qtyStep = instrument->lotSizeFilter.qtyStep;
+
+			if (tickSize <= 0.0 || qtyStep <= 0.0) {
+				const auto msg = "Incomplete asset info for: " + std::string(Asset);
+				spdlog::error("{}: {}", MAKE_FILELINE, msg);
+				BrokerError(msg.c_str());
+				return 0;
+			}
+
+			if (pPip) {
+				*pPip = tickSize;
+			}
+
+			if (pLotAmount) {
+				*pLotAmount = qtyStep;
+			}
+
+			if (pPipCost) {
+				*pPipCost = tickSize * qtyStep;
+			}
+
+#ifdef _WIN64
+			lotAmounts.insert_or_assign(Asset, qtyStep);
+#endif
 		} catch (std::exception &e) {
 			spdlog::error("{}: {}\n", MAKE_FILELINE, e.what());
 			BrokerError("Cannot acquire asset info from server.");
+			return 0;
 		}
 	}
 
 	try {
-		/// Check if the Book Ticker Stream is subscribed for the Asset
+		/// Check if the Ticker Stream is subscribed for the Asset
 		streamManager->subscribeTickerStream(Asset);
 
+		if (subscribing) {
+			/// Subscription call - the asset exists and its stream is running, that is all Zorro asks for here.
+			/// It must NOT depend on a quote having arrived: an asset that returns 0 after subscription triggers
+			/// Error 053 and gets its trading disabled, while an illiquid symbol can stay silent for minutes.
+			return 1;
+		}
+
+		/// Reading falls back to a REST snapshot when the stream stays silent, which is the normal case for an
+		/// illiquid symbol - its top of book simply does not change for minutes.
 		if (const auto instrumentInfo = streamManager->readEventTicker(Asset)) {
 			const auto &info = *instrumentInfo;
 
-			if (info.m_ask1Price == 0.0 || info.m_bid1Price == 0.0) {
+			if (info.ask1Price <= 0.0 || info.bid1Price <= 0.0) {
+				const auto msg = "Invalid bid/ask for Asset: " + std::string(Asset);
+				spdlog::error("{}: {}", MAKE_FILELINE, msg);
 				return 0;
 			}
 
+			/// Zorro expects the ask price here, the bid is derived from it via the spread
 			if (pPrice) {
-				*pPrice = info.m_lastPrice;
+				*pPrice = info.ask1Price;
 			}
 			if (pSpread) {
-				*pSpread = info.m_ask1Price - info.m_bid1Price;
+				*pSpread = info.ask1Price - info.bid1Price;
 			}
 			if (pVolume) {
-				/// Bybit has no relevant volume info in instrumentInfo stream
+				/// The ticker stream carries no traded volume, the top of book depth is the closest proxy
+				*pVolume = info.ask1Size + info.bid1Size;
 			}
 
 			return 1;
 		}
-		const auto msg = "Could not read Book Ticker Stream for Asset: " + std::string(Asset) + ", reading timeout";
+		const auto msg = "Could not read Ticker Stream for Asset: " + std::string(Asset) + ", reading timeout";
 		spdlog::error("{}: {}", MAKE_FILELINE, msg);
 	} catch (std::exception &e) {
 		spdlog::error("{}: {}", MAKE_FILELINE, e.what());
@@ -368,18 +509,45 @@ DLLFUNC_C int BrokerAccount(char *Account, double *pdBalance, double *pdTradeVal
 	try {
 		const auto accountBalances = restClient->getWalletBalance(AccountType::UNIFIED);
 
-		if (pdBalance) {
-			double totalBalance = 0.0;
-			for (const auto &el: accountBalances.m_balances) {
-				for (const auto &elCoin: el.m_coins) {
-					if (elCoin.m_coin == accountCurrency) {
-						totalBalance += elCoin.m_walletBalance;
-					}
+		double totalBalance = 0.0;
+		double totalUnrealisedPnl = 0.0;
+		double totalMargin = 0.0;
+		bool coinFound = false;
+
+		for (const auto &el: accountBalances.balances) {
+			for (const auto &elCoin: el.coins) {
+				if (elCoin.coin != accountCurrency) {
+					continue;
 				}
+
+				coinFound = true;
+				totalBalance += elCoin.walletBalance;
+				totalUnrealisedPnl += elCoin.unrealisedPnl;
+				totalMargin += elCoin.totalPositionIM + elCoin.totalOrderIM;
 			}
-			*pdBalance = totalBalance;
-			return 1;
 		}
+
+		if (!coinFound) {
+			const auto msg = "Account currency not found: " + accountCurrency;
+			spdlog::error("{}: {}", MAKE_FILELINE, msg);
+			BrokerError(msg.c_str());
+			return 0;
+		}
+
+		if (pdBalance) {
+			*pdBalance = totalBalance;
+		}
+
+		/// Value of open positions and the margin they bind - without those Zorro cannot track equity
+		if (pdTradeVal) {
+			*pdTradeVal = totalUnrealisedPnl;
+		}
+
+		if (pdMarginVal) {
+			*pdMarginVal = totalMargin;
+		}
+
+		return 1;
 	} catch (std::exception &e) {
 		spdlog::error("{}: {}", MAKE_FILELINE, e.what());
 		BrokerError("Cannot acquire wallet balance from server.");
@@ -444,14 +612,14 @@ DLLFUNC_C int BrokerHistory2(char *Asset, DATE tStart, DATE tEnd, int nTickMinut
 
 		/// From most recent to oldest.
 		for (int i = 0; i < maxCandles; i++, ticks++) {
-			ticks->fOpen = static_cast<float>(candles[i].m_open);
-			ticks->fHigh = static_cast<float>(candles[i].m_high);
-			ticks->fLow = static_cast<float>(candles[i].m_low);
-			ticks->fClose = static_cast<float>(candles[i].m_close);
-			ticks->fVol = static_cast<float>(candles[i].m_volume);
+			ticks->fOpen = static_cast<float>(candles[i].open);
+			ticks->fHigh = static_cast<float>(candles[i].high);
+			ticks->fLow = static_cast<float>(candles[i].low);
+			ticks->fClose = static_cast<float>(candles[i].close);
+			ticks->fVol = static_cast<float>(candles[i].volume);
 
 			/// Zorro uses reversed order in time series so that's why...
-			ticks->time = convertTime(candles[i].m_startTime + msInInterval);
+			ticks->time = convertTime(candles[i].startTime + msInInterval);
 		}
 
 		return maxCandles;
@@ -463,9 +631,60 @@ DLLFUNC_C int BrokerHistory2(char *Asset, DATE tStart, DATE tEnd, int nTickMinut
 	return 0;
 }
 
+/// True once the exchange has made up its mind about the order - anything else means "ask again"
+bool isSettledOrderStatus(const OrderStatus status) {
+	switch (status) {
+		case OrderStatus::New:
+		case OrderStatus::PartiallyFilled:
+		case OrderStatus::PartiallyFilledCanceled:
+		case OrderStatus::Filled:
+		case OrderStatus::Cancelled:
+		case OrderStatus::Rejected:
+		case OrderStatus::Deactivated:
+		case OrderStatus::Active:
+			return true;
+		default:
+			/// Created, PendingCancel, Untriggered, Triggered
+			return false;
+	}
+}
+
+/// A resting order (New) is a valid outcome, not a failure - it must be reported to Zorro as a pending trade
+bool isLiveOrderStatus(const OrderStatus status) {
+	return status == OrderStatus::New || status == OrderStatus::PartiallyFilled || status == OrderStatus::Filled ||
+	       status == OrderStatus::Active;
+}
+
+/**
+ * Bybit's order create response carries no execution state, it has to be polled. Returns the last state seen, or
+ * bad option when the order could not be resolved within the attempt budget.
+ */
+std::optional<OrderResponse> pollOrderState(const std::string &symbol, const OrderId &orderId) {
+	std::optional<OrderResponse> lastState;
+
+	for (int attempt = 0; attempt < MAX_ORDER_POLL_ATTEMPTS; attempt++) {
+		if (const auto activeOrder = restClient->getOpenOrder(Category::linear, symbol, orderId.orderId,
+		                                                      orderId.orderLinkId)) {
+			lastState = activeOrder;
+
+			if (isSettledOrderStatus(activeOrder->orderStatus)) {
+				return lastState;
+			}
+		}
+
+		std::this_thread::sleep_for(ORDER_POLL_INTERVAL);
+	}
+
+	return lastState;
+}
+
 DLLFUNC_C int BrokerBuy2(char *Asset, int Amount, double dStopDist, double Limit, double *pPrice, int *pFill) {
 	if (!restClient) {
 		spdlog::critical("{}: {}", MAKE_FILELINE, "Bybit Rest Client instance not initialized.");
+		return 0;
+	}
+
+	if (!Asset || !*Asset || Amount == 0) {
 		return 0;
 	}
 
@@ -485,94 +704,104 @@ DLLFUNC_C int BrokerBuy2(char *Asset, int Amount, double dStopDist, double Limit
 		             std::to_string(Limit));
 
 		Order order;
-		order.m_symbol = Asset;
+		order.symbol = Asset;
 
 		if (Amount > 0) {
-			order.m_side = Side::Buy;
+			order.side = Side::Buy;
 		} else {
-			order.m_side = Side::Sell;
+			order.side = Side::Sell;
 		}
 
 		if (orderType == 1) {
-			order.m_timeInForce = TimeInForce::IOC;
+			order.timeInForce = TimeInForce::IOC;
 		} else if (orderType == 2) {
-			order.m_timeInForce = TimeInForce::GTC;
+			order.timeInForce = TimeInForce::GTC;
 		} else {
-			order.m_timeInForce = TimeInForce::FOK;
+			order.timeInForce = TimeInForce::FOK;
 		}
 
+		/// NOTE: dStopDist is deliberately ignored - this plugin does not attach a broker side stop to the order,
+		/// so the stop loss stays with Zorro and is only executed while Zorro is running. See README.
 		if (Limit > 0.) {
-			order.m_price = Limit;
-			order.m_orderType = OrderType::Limit;
+			order.price = Limit;
+			order.orderType = OrderType::Limit;
 		} else {
-			order.m_orderType = OrderType::Market;
+			order.orderType = OrderType::Market;
 		}
 
-		order.m_qty = lotAmount * std::abs(Amount);
+		order.qty = lotAmount * std::abs(Amount);
 
 		readBybitLastOrderId();
-		order.m_orderLinkId = std::to_string(lastOrderId++);
+		order.orderLinkId = std::to_string(lastOrderId++);
 		writeBybitLastOrderId();
 
-		auto positionResponse = restClient->getPositionInfo(Category::linear, Asset);
-
-		if (!positionResponse.empty()) {
-			if (positionResponse[0].m_positionIdx) {
-				if (order.m_side == Side::Buy) {
-					order.m_positionIdx = 1;
-				} else if (order.m_side == Side::Sell) {
-					order.m_positionIdx = 2;
-				}
-			} else {
-				order.m_positionIdx = 0;
-			}
+		/// A non-zero positionIdx on the existing position record means the account is in Hedge mode; One-way mode
+		/// requires positionIdx 0, which is also the safe default when no position record exists yet.
+		if (const auto positionResponse = restClient->getPositionInfo(Category::linear, Asset);
+			!positionResponse.empty() && positionResponse[0].positionIdx != 0) {
+			order.positionIdx = order.side == Side::Buy ? 1 : 2;
+		} else {
+			order.positionIdx = 0;
 		}
 
-		auto orderId = restClient->placeOrder(order);
-		OrderResponse orderResponse{};
+		const auto tradeId = std::stoi(order.orderLinkId);
+		const auto orderId = restClient->placeOrder(order);
+		const auto orderState = pollOrderState(Asset, orderId);
 
-		int attemptNo = 0;
+		if (!orderState) {
+			/// The order was accepted by placeOrder but its state never resolved - it may be live on the exchange
+			spdlog::error("{}: {}", MAKE_FILELINE,
+			              "Order state could not be resolved, order may be live on the exchange, orderLinkId: " +
+			              order.orderLinkId);
+			BrokerError("No order confirmation from server, order state unknown.");
+			return -2;
+		}
 
-		while (orderResponse.m_orderStatus != OrderStatus::Active &&
-		       orderResponse.m_orderStatus != OrderStatus::Filled) {
-			const auto activeOrder = restClient->getOpenOrder(Category::linear, Asset, orderId.m_orderId,
-			                                                  orderId.m_orderLinkId);
+		const auto filledLots = static_cast<int>(std::round(orderState->cumExecQty / lotAmount));
 
-			if (activeOrder) {
-				orderResponse.m_orderStatus = activeOrder->m_orderStatus;
-				orderResponse.m_avgPrice = activeOrder->m_avgPrice;
-				orderResponse.m_cumExecQty = activeOrder->m_cumExecQty;
-				orderResponse.m_orderLinkId = activeOrder->m_orderLinkId;
-			}
-
-			attemptNo++;
-
-			if (int maxAttempts = 10; attemptNo == maxAttempts) {
-				spdlog::error("Send order failed due timeout: attemptNo == maxAttempts");
-				spdlog::error(
-					"Cannot send order to server, reason: market order was not filled or a trigger order was not activated, order response: {}",
-					orderResponse.toJson().dump());
-				BrokerError("Cannot send order to server.");
-				return 0;
+		/// A GTC limit order normally comes back as New - it rests on the book and must NOT be reported as a
+		/// failure, otherwise it stays open on the exchange while Zorro believes nothing happened. A partially
+		/// filled IOC (PartiallyFilledCanceled) is a real position and must be reported as well.
+		if (isLiveOrderStatus(orderState->orderStatus) || filledLots > 0) {
+			if (pPrice && orderState->avgPrice > 0.0) {
+				*pPrice = orderState->avgPrice;
 			}
 
-			std::this_thread::sleep_for(500ms);
+			if (pFill) {
+				*pFill = filledLots;
+			}
+
+			spdlog::info("Order placed for asset: " + std::string(Asset) + ", status: " +
+			             std::string(magic_enum::enum_name(orderState->orderStatus)) + ", filled size: " +
+			             std::to_string(orderState->cumExecQty / lotAmount) + ", average price: " +
+			             std::to_string(orderState->avgPrice) + ", clientId: " + order.orderLinkId);
+
+			storeOpenTrade(tradeId, Asset, Amount);
+			return tradeId;
 		}
 
-		if (pPrice) {
-			*pPrice = orderResponse.m_avgPrice;
+		if (!isSettledOrderStatus(orderState->orderStatus)) {
+			/// Still Created/Untriggered after the whole poll budget - the order is not dead, its outcome is
+			/// unknown. Reporting a rejection here would invite a duplicate order.
+			spdlog::error("{}: {}", MAKE_FILELINE,
+			              "Order not settled within the poll budget, state unknown, orderLinkId: " +
+			              order.orderLinkId);
+			BrokerError("No order confirmation from server, order state unknown.");
+			return -2;
 		}
 
-		if (pFill) {
-			*pFill = std::round(orderResponse.m_cumExecQty / lotAmount);
-		}
-
-		spdlog::info("Order placed for asset: " + std::string(Asset) + ", filled size: " +
-		             std::to_string(orderResponse.m_cumExecQty / lotAmount) + ", average price: " +
-		             std::to_string(orderResponse.m_avgPrice) + ", clientId: " + orderResponse.m_orderLinkId);
-
-		saveAssetForTradeId(Asset, stoi(orderResponse.m_orderLinkId));
-		return stoi(orderResponse.m_orderLinkId);
+		const std::string msg =
+				"Cannot place order: " + std::string(Asset) + ", size: " + std::to_string(Amount) +
+				", reason: " + std::string(magic_enum::enum_name(orderState->orderStatus)) +
+				(orderState->rejectReason.empty() ? "" : ", " + orderState->rejectReason);
+		spdlog::error("{}: {}", MAKE_FILELINE, msg);
+		BrokerError(msg.c_str());
+	} catch (const TransportError &e) {
+		/// The order may well have reached the exchange - reporting a rejection here would risk a duplicate order.
+		/// -2 tells Zorro that the broker did not confirm within the wait time.
+		spdlog::error("{}: {}", MAKE_FILELINE, e.what());
+		BrokerError("No confirmation from server, order state unknown.");
+		return -2;
 	} catch (std::exception &e) {
 		spdlog::error("{}: {}", MAKE_FILELINE, e.what());
 		BrokerError("Cannot send order to server.");
@@ -588,12 +817,19 @@ BrokerSell2(int nTradeId, int nAmount, double Limit, double *pClose, double *pCo
 		return 0;
 	}
 
-	try {
-		auto asset = findAssetForTradeId(nTradeId);
+	if (nAmount == 0) {
+		return 0;
+	}
 
-		if (asset.empty()) {
+	try {
+		/// Do NOT drop the mapping here - if the closing order fails the trade would become impossible to close
+		const auto openTrade = findOpenTrade(nTradeId);
+
+		if (!openTrade) {
 			return 0;
 		}
+
+		const auto asset = openTrade->asset;
 
 #ifdef _WIN64
 		auto it = lotAmounts.find(asset);
@@ -606,93 +842,174 @@ BrokerSell2(int nTradeId, int nAmount, double Limit, double *pClose, double *pCo
 		}
 #endif
 		Order order;
-		order.m_symbol = asset;
+		order.symbol = asset;
 
 		if (nAmount > 0) {
-			order.m_side = Side::Sell;
+			order.side = Side::Sell;
 		} else {
-			order.m_side = Side::Buy;
+			order.side = Side::Buy;
 		}
 
 		if (Limit > 0.) {
-			order.m_price = Limit;
-			order.m_orderType = OrderType::Limit;
+			order.price = Limit;
+			order.orderType = OrderType::Limit;
 		} else {
-			order.m_orderType = OrderType::Market;
+			order.orderType = OrderType::Market;
 		}
 
-		order.m_qty = lotAmount * std::abs(nAmount);
+		order.qty = lotAmount * std::abs(nAmount);
 
 		readBybitLastOrderId();
-		order.m_orderLinkId = std::to_string(lastOrderId++);
+		order.orderLinkId = std::to_string(lastOrderId++);
 		writeBybitLastOrderId();
 
-		order.m_timeInForce = TimeInForce::GTC;
+		order.timeInForce = TimeInForce::GTC;
 
-		auto positionResponse = restClient->getPositionInfo(Category::linear, asset);
-
-		if (!positionResponse.empty()) {
-			if (positionResponse[0].m_positionIdx) {
-				if (order.m_side == Side::Buy) {
-					order.m_positionIdx = 2;
-				} else if (order.m_side == Side::Sell) {
-					order.m_positionIdx = 1;
-				}
-			} else {
-				order.m_positionIdx = 0;
-			}
+		/// Hedge mode closes the leg identified by positionIdx, One-way mode expresses the closing intent through
+		/// reduceOnly, which also prevents an oversized close from flipping the position
+		if (const auto positionResponse = restClient->getPositionInfo(Category::linear, asset);
+			!positionResponse.empty() && positionResponse[0].positionIdx != 0) {
+			order.positionIdx = order.side == Side::Buy ? 2 : 1;
+		} else {
+			order.positionIdx = 0;
+			order.reduceOnly = true;
 		}
 
-		auto orderId = restClient->placeOrder(order);
-		OrderResponse orderResponse{};
+		const auto orderId = restClient->placeOrder(order);
+		const auto orderState = pollOrderState(asset, orderId);
 
-		int attemptNo = 0;
-
-		while (orderResponse.m_orderStatus != OrderStatus::Active &&
-		       orderResponse.m_orderStatus != OrderStatus::Filled) {
-			const auto activeOrder = restClient->getOpenOrder(Category::linear, asset, orderId.m_orderId,
-			                                                  orderId.m_orderLinkId);
-
-			if (activeOrder) {
-				orderResponse.m_orderStatus = activeOrder->m_orderStatus;
-				orderResponse.m_avgPrice = activeOrder->m_avgPrice;
-				orderResponse.m_cumExecQty = activeOrder->m_cumExecQty;
-				orderResponse.m_orderLinkId = activeOrder->m_orderLinkId;
-			}
-
-			attemptNo++;
-
-			if (int maxAttempts = 10; attemptNo == maxAttempts) {
-				spdlog::error("Send order failed due timeout: attemptNo == maxAttempts");
-				spdlog::error(
-					"Cannot send order to server, reason: market order was not filled or a trigger order was not activated, order response: {}",
-					orderResponse.toJson().dump());
-				BrokerError("Cannot send order to server.");
-				return 0;
-			}
-
-			std::this_thread::sleep_for(500ms);
+		if (!orderState) {
+			spdlog::error("{}: {}", MAKE_FILELINE,
+			              "Closing order state could not be resolved, order may be live on the exchange, "
+			              "orderLinkId: " + order.orderLinkId);
+			BrokerError("No order confirmation from server, close state unknown.");
+			return 0;
 		}
 
-		if (pFill) {
-			*pFill = std::round(orderResponse.m_cumExecQty / lotAmount);
+		const auto filledLots = static_cast<int>(std::round(orderState->cumExecQty / lotAmount));
+
+		/// A partial close (IOC leftovers cancelled) still closed real lots and must be booked
+		if (isLiveOrderStatus(orderState->orderStatus) || filledLots > 0) {
+			if (pFill) {
+				*pFill = filledLots;
+			}
+
+			if (pClose && orderState->avgPrice > 0.0) {
+				*pClose = orderState->avgPrice;
+			}
+
+			spdlog::info("Closing order placed for asset: " + std::string(asset) + ", status: " +
+			             std::string(magic_enum::enum_name(orderState->orderStatus)) + ", filled size: " +
+			             std::to_string(orderState->cumExecQty / lotAmount) + ", average price: " +
+			             std::to_string(orderState->avgPrice) + ", clientId: " + order.orderLinkId);
+
+			/// Book the closed lots against the record, it is dropped once nothing is left open
+			if (filledLots > 0) {
+				reduceOpenTrade(nTradeId, filledLots);
+			}
+
+			/// Zorro keeps addressing the remainder by the original id
+			return nTradeId;
 		}
 
-		spdlog::info("Closed order placed for asset: " + std::string(asset) + ", filled size: " +
-		             std::to_string(orderResponse.m_cumExecQty / lotAmount) + ", average price: " +
-		             std::to_string(orderResponse.m_avgPrice) + ", clientId: " + orderResponse.m_orderLinkId);
-
-		/// Just erase the tradeId
-		findAssetForTradeId(nTradeId, true);
-
-		return stoi(orderResponse.m_orderLinkId);
+		const std::string msg =
+				"Cannot place order: " + std::string(asset) + ", size: " + std::to_string(nAmount) +
+				", reason: " + std::string(magic_enum::enum_name(orderState->orderStatus)) +
+				(orderState->rejectReason.empty() ? "" : ", " + orderState->rejectReason);
+		spdlog::error("{}: {}", MAKE_FILELINE, msg);
+		BrokerError(msg.c_str());
+	} catch (const TransportError &e) {
+		/// BrokerSell2 has no return code for "unknown state", so Zorro will retry. A repeated close is bounded by
+		/// the position itself - reduceOnly in One-way mode, the position leg in Hedge mode.
+		spdlog::error("{}: closing order not confirmed, state unknown: {}", MAKE_FILELINE, e.what());
+		BrokerError("No confirmation from server, close state unknown.");
 	} catch (std::exception &e) {
 		spdlog::error("{}: {}", MAKE_FILELINE, e.what());
 		BrokerError("Cannot close trade.");
 	}
 
-
 	return 0;
+}
+
+/**
+ * Report the fill state of an order/trade back to Zorro. Without it Zorro cannot tell whether a resting limit order
+ * has been filled in the meantime.
+ *
+ * Return value (Zorro broker API): current fill amount in lots as in BrokerBuy2, -1 when the trade was completely
+ * closed, NAY when the state is unavailable, NAY-1 when the order was cancelled or removed by the broker.
+ */
+DLLFUNC_C int BrokerTrade(int nTradeId, double *pOpen, double *pClose, double *pCost, double *pProfit) {
+	if (!restClient) {
+		spdlog::critical("{}: {}", MAKE_FILELINE, "Bybit Rest Client instance not initialized.");
+		return NAY;
+	}
+
+	const auto openTrade = findOpenTrade(nTradeId);
+
+	if (!openTrade) {
+		/// Nothing open under this id - either it was closed through this plugin, or it is simply not known here
+		return wasTradeClosed(nTradeId) ? -1 : NAY;
+	}
+
+	try {
+#ifdef _WIN64
+		if (const auto it = lotAmounts.find(openTrade->asset); it != lotAmounts.end()) {
+			lotAmount = it->second;
+		} else {
+			spdlog::error("{}: Cannot find lot amount size for asset: {}", MAKE_FILELINE, openTrade->asset);
+			return NAY;
+		}
+#endif
+		const auto orderLinkId = std::to_string(nTradeId);
+		double filledQty = 0.0;
+		double avgPrice = 0.0;
+
+		if (const auto order = restClient->getOpenOrder(Category::linear, openTrade->asset, "", orderLinkId)) {
+			if (!isLiveOrderStatus(order->orderStatus)) {
+				/// Cancelled, Rejected, Deactivated - anything filled before is a real position
+				const auto lots = static_cast<int>(std::round(order->cumExecQty / lotAmount));
+				return lots > 0 ? lots : NAY - 1;
+			}
+
+			filledQty = order->cumExecQty;
+			avgPrice = order->avgPrice;
+		} else {
+			/// Bybit's realtime order endpoint only serves orders that are still open. A fully filled order is
+			/// gone from it, so the fills themselves are the remaining source of truth.
+			double execValue = 0.0;
+
+			for (const auto &execution: restClient->getExecutions(Category::linear, openTrade->asset, orderLinkId)) {
+				if (execution.execType != ExecType::Trade) {
+					/// Funding and the like share this topic, they are not fills
+					continue;
+				}
+
+				filledQty += execution.execQty;
+				execValue += execution.execValue;
+			}
+
+			if (filledQty <= 0.0) {
+				/// Neither open nor ever filled - the order is gone from the broker
+				return NAY - 1;
+			}
+
+			avgPrice = execValue / filledQty;
+		}
+
+		if (pOpen && avgPrice > 0.0) {
+			*pOpen = avgPrice;
+		}
+
+		const auto filledLots = static_cast<int>(std::round(filledQty / lotAmount));
+
+		/// The order carries the size it was opened with, the record carries what is still open after partial
+		/// closes. Legacy records have no size, there the order is the only source of truth.
+		return openTrade->lots != 0 ? std::min(std::abs(openTrade->lots), filledLots) : filledLots;
+	} catch (std::exception &e) {
+		spdlog::error("{}: {}", MAKE_FILELINE, e.what());
+	}
+
+	return NAY;
 }
 
 DLLFUNC_C double BrokerCommand(int Command, DWORD dwParameter) {
@@ -710,6 +1027,12 @@ DLLFUNC_C double BrokerCommand(int Command, DWORD dwParameter) {
 			return 1;
 		case SET_WAIT:
 			waitMs = dwParameter;
+
+			/// Drives how long a price read may block before falling back to the REST snapshot. Clamped so that a
+			/// generous Zorro setting cannot stall the whole asset loop.
+			if (streamManager) {
+				streamManager->setTimeout(std::clamp(waitMs / 1000, 1, STREAM_READ_TIMEOUT_S));
+			}
 		case GET_WAIT:
 			return waitMs;
 		case SET_SYMBOL:
@@ -724,17 +1047,29 @@ DLLFUNC_C double BrokerCommand(int Command, DWORD dwParameter) {
 					double totalPositionAmt = 0;
 
 					for (const auto &position: positions) {
-						if (position.m_side == Side::Sell) {
-							totalPositionAmt -= position.m_size;
+						if (position.side == Side::Sell) {
+							totalPositionAmt -= position.size;
 						} else {
-							totalPositionAmt += position.m_size;
+							totalPositionAmt += position.size;
 						}
 					}
 
-					/// Return real position size instead of lot amount
-					/// totalPositionAmt = totalPositionAmt / lotAmount;
+					/// Zorro expects the net open amount in the same unit as BrokerBuy2, i.e. in lots, not in
+					/// contracts. The lot size is per symbol, the global lotAmount belongs to the last order.
+					double symbolLotAmount = lotAmount;
+#ifdef _WIN64
+					if (const auto it = lotAmounts.find(symbol); it != lotAmounts.end()) {
+						symbolLotAmount = it->second;
+					} else {
+						spdlog::error("{}: Cannot find lot amount size for asset: {}", MAKE_FILELINE, symbol);
+						return 0;
+					}
+#endif
+					if (symbolLotAmount <= 0.0) {
+						return 0;
+					}
 
-					return totalPositionAmt;
+					return totalPositionAmt / symbolLotAmount;
 				} catch (std::exception &e) {
 					spdlog::error("{}: {}", MAKE_FILELINE, e.what());
 					BrokerError((std::string("Cannot get position of " + std::string(symbol)).c_str()));
@@ -755,7 +1090,7 @@ DLLFUNC_C double BrokerCommand(int Command, DWORD dwParameter) {
 					const auto id = restClient->cancelOrder(Category::linear, currentSymbol, "",
 					                                        std::to_string(dwParameter));
 					spdlog::info("Order canceled for asset: " + std::string(currentSymbol) + ", order id: " +
-					             id.m_orderLinkId);
+					             id.orderLinkId);
 					return 1;
 				} catch (std::exception &e) {
 					spdlog::error("{}: {}", MAKE_FILELINE, e.what());

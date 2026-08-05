@@ -21,10 +21,10 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="framework.h">
+    <ClInclude Include="..\include\bybit_futures.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="pch.h">
+    <ClInclude Include="..\include\stdafx.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -38,34 +38,34 @@
     <ClCompile Include="..\src\bybit_futures.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="..\bybit_cpp_api\src\bybit.cpp">
+    <ClCompile Include="..\bybit-cpp-api\src\bybit.cpp">
       <Filter>bybit_api</Filter>
     </ClCompile>
-    <ClCompile Include="..\bybit_cpp_api\src\bybit_event_models.cpp">
+    <ClCompile Include="..\bybit-cpp-api\src\bybit_event_models.cpp">
       <Filter>bybit_api</Filter>
     </ClCompile>
-    <ClCompile Include="..\bybit_cpp_api\src\bybit_http_session.cpp">
+    <ClCompile Include="..\bybit-cpp-api\src\bybit_http_session.cpp">
       <Filter>bybit_api</Filter>
     </ClCompile>
-    <ClCompile Include="..\bybit_cpp_api\src\bybit_models.cpp">
+    <ClCompile Include="..\bybit-cpp-api\src\bybit_models.cpp">
       <Filter>bybit_api</Filter>
     </ClCompile>
-    <ClCompile Include="..\bybit_cpp_api\src\bybit_rest_client.cpp">
+    <ClCompile Include="..\bybit-cpp-api\src\bybit_rest_client.cpp">
       <Filter>bybit_api</Filter>
     </ClCompile>
-    <ClCompile Include="..\bybit_cpp_api\src\bybit_ws_client.cpp">
+    <ClCompile Include="..\bybit-cpp-api\src\bybit_ws_client.cpp">
       <Filter>bybit_api</Filter>
     </ClCompile>
-    <ClCompile Include="..\bybit_cpp_api\src\bybit_ws_session.cpp">
+    <ClCompile Include="..\bybit-cpp-api\src\bybit_ws_session.cpp">
       <Filter>bybit_api</Filter>
     </ClCompile>
-    <ClCompile Include="..\bybit_cpp_api\src\bybit_ws_stream_manager.cpp">
+    <ClCompile Include="..\bybit-cpp-api\src\bybit_ws_stream_manager.cpp">
       <Filter>bybit_api</Filter>
     </ClCompile>
-    <ClCompile Include="..\bybit_cpp_api\vk_cpp_common\src\registry.cpp">
+    <ClCompile Include="..\bybit-cpp-api\stonky-cpp-common\src\registry.cpp">
       <Filter>common</Filter>
     </ClCompile>
-    <ClCompile Include="..\bybit_cpp_api\vk_cpp_common\src\utils.cpp">
+    <ClCompile Include="..\bybit-cpp-api\stonky-cpp-common\src\utils.cpp">
       <Filter>common</Filter>
     </ClCompile>
   </ItemGroup>

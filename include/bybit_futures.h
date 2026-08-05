@@ -46,4 +46,6 @@ DLLFUNC_C int BrokerAccount(char *Account, double *pdBalance, double *pdTradeVal
 DLLFUNC_C int BrokerSell2(int nTradeId, int nAmount, double Limit, double *pClose, double *pCost, double *pProfit,
                           int *pFill);
 
+DLLFUNC_C int BrokerTrade(int nTradeId, double *pOpen, double *pClose, double *pCost, double *pProfit);
+
 #endif //BYBIT_FUTURES_ZORRO_PLUGIN_H

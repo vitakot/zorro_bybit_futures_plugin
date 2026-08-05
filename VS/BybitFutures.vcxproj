@@ -21,8 +21,8 @@
   <PropertyGroup Label="Globals">
     <VCProjectVersion>16.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
-    <ProjectGuid>{6673c4da-e4fd-427e-9991-3b309d4c0dca}</ProjectGuid>
-    <RootNamespace>BinanceFutures</RootNamespace>
+    <ProjectGuid>{9E2C1B74-5D3A-4F16-9C0B-7A4E8D25F311}</ProjectGuid>
+    <RootNamespace>BybitFutures</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -89,9 +89,9 @@
       <PreprocessorDefinitions>WIN32;_DEBUG;BYBIT_FUTURES_DLL_EXPORTS;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;VERBOSE_LOG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\bybit_cpp_api\vk_cpp_common\include;$(ProjectDir)..\bybit_cpp_api\include;$(ProjectDir)..\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\bybit-cpp-api\stonky-cpp-common\include;$(ProjectDir)..\bybit-cpp-api\include;$(ProjectDir)..\include</AdditionalIncludeDirectories>
       <AdditionalOptions>/bigobj /utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <LanguageStandard>stdcpp20</LanguageStandard>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -99,7 +99,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
       <AdditionalLibraryDirectories>C:\vcpkg\installed\x86-windows-static\lib</AdditionalLibraryDirectories>
-      <AdditionalDependencies>spdlog.lib;libcrypto.lib;libucrtd.lib;libssl.lib;crypt32.lib;psapi.lib;iphlpapi.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>zlibd.lib;spdlog.lib;libcrypto.lib;libucrtd.lib;libssl.lib;crypt32.lib;psapi.lib;iphlpapi.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <IgnoreSpecificDefaultLibraries>LIBCMT.lib</IgnoreSpecificDefaultLibraries>
     </Link>
   </ItemDefinitionGroup>
@@ -112,9 +112,9 @@
       <PreprocessorDefinitions>WIN32;NDEBUG;BYBIT_FUTURES_DLL_EXPORTS;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;VERBOSE_LOG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\bybit_cpp_api\vk_cpp_common\include;$(ProjectDir)..\bybit_cpp_api\include;$(ProjectDir)..\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\bybit-cpp-api\stonky-cpp-common\include;$(ProjectDir)..\bybit-cpp-api\include;$(ProjectDir)..\include</AdditionalIncludeDirectories>
       <AdditionalOptions>/bigobj /utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <LanguageStandard>stdcpp20</LanguageStandard>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -124,7 +124,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
       <AdditionalLibraryDirectories>C:\vcpkg\installed\x86-windows-static\lib</AdditionalLibraryDirectories>
-      <AdditionalDependencies>spdlog.lib;libcrypto.lib;libucrt.lib;libssl.lib;crypt32.lib;psapi.lib;iphlpapi.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>zlib.lib;spdlog.lib;libcrypto.lib;libucrt.lib;libssl.lib;crypt32.lib;psapi.lib;iphlpapi.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <IgnoreSpecificDefaultLibraries>
       </IgnoreSpecificDefaultLibraries>
     </Link>
@@ -136,8 +136,8 @@
       <PreprocessorDefinitions>_DEBUG;BYBIT_FUTURES_DLL_EXPORTS;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;VERBOSE_LOG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\bybit_cpp_api\vk_cpp_common\include;$(ProjectDir)..\bybit_cpp_api\include;$(ProjectDir)..\include</AdditionalIncludeDirectories>
-      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\bybit-cpp-api\stonky-cpp-common\include;$(ProjectDir)..\bybit-cpp-api\include;$(ProjectDir)..\include</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
       <AdditionalOptions>/bigobj /utf-8 %(AdditionalOptions)</AdditionalOptions>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
@@ -146,7 +146,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
       <AdditionalLibraryDirectories>C:\vcpkg\installed\x64-windows-static\lib</AdditionalLibraryDirectories>
-      <AdditionalDependencies>spdlog.lib;libcrypto.lib;libucrtd.lib;ucrtd.lib;libssl.lib;crypt32.lib;psapi.lib;iphlpapi.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>zlibd.lib;spdlog.lib;libcrypto.lib;libucrtd.lib;ucrtd.lib;libssl.lib;crypt32.lib;psapi.lib;iphlpapi.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <IgnoreSpecificDefaultLibraries>LIBCMT.lib</IgnoreSpecificDefaultLibraries>
     </Link>
   </ItemDefinitionGroup>
@@ -159,8 +159,8 @@
       <PreprocessorDefinitions>NDEBUG;BYBIT_FUTURES_DLL_EXPORTS;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;VERBOSE_LOG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\bybit_cpp_api\vk_cpp_common\include;$(ProjectDir)..\bybit_cpp_api\include;$(ProjectDir)..\include</AdditionalIncludeDirectories>
-      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\bybit-cpp-api\stonky-cpp-common\include;$(ProjectDir)..\bybit-cpp-api\include;$(ProjectDir)..\include</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
       <AdditionalOptions>/bigobj /utf-8 %(AdditionalOptions)</AdditionalOptions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
@@ -171,26 +171,26 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
       <AdditionalLibraryDirectories>C:\vcpkg\installed\x64-windows-static\lib</AdditionalLibraryDirectories>
-      <AdditionalDependencies>spdlog.lib;libcrypto.lib;libssl.lib;libucrt.lib;crypt32.lib;psapi.lib;iphlpapi.lib;userenv.lib;ucrt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>zlib.lib;spdlog.lib;libcrypto.lib;libssl.lib;libucrt.lib;crypt32.lib;psapi.lib;iphlpapi.lib;userenv.lib;ucrt.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <IgnoreSpecificDefaultLibraries>
       </IgnoreSpecificDefaultLibraries>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="framework.h" />
-    <ClInclude Include="pch.h" />
+    <ClInclude Include="..\include\bybit_futures.h" />
+    <ClInclude Include="..\include\stdafx.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\bybit_cpp_api\src\bybit.cpp" />
-    <ClCompile Include="..\bybit_cpp_api\src\bybit_event_models.cpp" />
-    <ClCompile Include="..\bybit_cpp_api\src\bybit_http_session.cpp" />
-    <ClCompile Include="..\bybit_cpp_api\src\bybit_models.cpp" />
-    <ClCompile Include="..\bybit_cpp_api\src\bybit_rest_client.cpp" />
-    <ClCompile Include="..\bybit_cpp_api\src\bybit_ws_client.cpp" />
-    <ClCompile Include="..\bybit_cpp_api\src\bybit_ws_session.cpp" />
-    <ClCompile Include="..\bybit_cpp_api\src\bybit_ws_stream_manager.cpp" />
-    <ClCompile Include="..\bybit_cpp_api\vk_cpp_common\src\registry.cpp" />
-    <ClCompile Include="..\bybit_cpp_api\vk_cpp_common\src\utils.cpp" />
+    <ClCompile Include="..\bybit-cpp-api\src\bybit.cpp" />
+    <ClCompile Include="..\bybit-cpp-api\src\bybit_event_models.cpp" />
+    <ClCompile Include="..\bybit-cpp-api\src\bybit_http_session.cpp" />
+    <ClCompile Include="..\bybit-cpp-api\src\bybit_models.cpp" />
+    <ClCompile Include="..\bybit-cpp-api\src\bybit_rest_client.cpp" />
+    <ClCompile Include="..\bybit-cpp-api\src\bybit_ws_client.cpp" />
+    <ClCompile Include="..\bybit-cpp-api\src\bybit_ws_session.cpp" />
+    <ClCompile Include="..\bybit-cpp-api\src\bybit_ws_stream_manager.cpp" />
+    <ClCompile Include="..\bybit-cpp-api\stonky-cpp-common\src\registry.cpp" />
+    <ClCompile Include="..\bybit-cpp-api\stonky-cpp-common\src\utils.cpp" />
     <ClCompile Include="..\dllmain.cpp" />
     <ClCompile Include="..\src\bybit_futures.cpp" />
     <ClCompile Include="..\src\stdafx.cpp" />
