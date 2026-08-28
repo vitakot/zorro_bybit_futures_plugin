@@ -20,6 +20,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 
@@ -52,10 +53,20 @@ static constexpr int INSTRUMENTS_UPDATE_PERIOD_S = 900;
 static constexpr int MAX_ORDER_POLL_ATTEMPTS = 10;
 static constexpr auto ORDER_POLL_INTERVAL = 250ms;
 
+/// Successful traffic newer than this counts as proof that the connection is alive, so BrokerTime does not have to
+/// probe the exchange on every call
+static constexpr std::int64_t CONNECTION_FRESH_MS = 30000;
+
+/// Minimum spacing between connection probes once the traffic went quiet
+static constexpr std::int64_t CONNECTION_PROBE_INTERVAL_MS = 10000;
+
 static std::string currentSymbol;
 static std::string accountCurrency;
 static int lastOrderId = 0;
 static int orderType = 0;
+/// Whether the account keeps long and short legs separately. Bybit has no account wide query for it, so it is
+/// learned from the position records when orders are placed; One-way, the venue default, is the safe assumption.
+static bool hedge = false;
 static double lotAmount = 1.0;
 static int loopMs = 50; // Zorro loop time, kept for GET_DELAY only
 static int waitMs = STREAM_READ_TIMEOUT_S * 1000; // Maximum broker response time, drives the stream read timeout
@@ -177,7 +188,15 @@ void readBybitLastOrderId() {
 /// operation. The mapping is persisted so that it survives a Zorro restart.
 struct OpenTrade {
 	std::string asset;
-	int lots{0}; /// Remaining open lots, 0 for records written by older plugin versions
+
+	/// Lots as REQUESTED from Zorro. It is an upper bound on what the entry order can ever fill, never the amount
+	/// that actually filled - a partially filled order fills less, and that difference is what the exchange holds.
+	int lots{0}; /// 0 for records written by older plugin versions
+
+	/// Lots closed so far, counted cumulatively instead of subtracted from "lots". Subtracting would mix the
+	/// requested size with the filled one: a request for 10 that filled 3 and was then fully closed would still
+	/// leave 7 "open" in the record while the exchange position is flat.
+	int closed{0};
 };
 
 /// Ids of recently closed trades, so that BrokerTrade can tell "fully closed" (-1) apart from "unknown" (NAY)
@@ -220,6 +239,10 @@ TradeStore loadTrades() {
 					if (const auto lotsIt = value.find("lots"); lotsIt != value.end()) {
 						openTrade.lots = lotsIt->get<int>();
 					}
+
+					if (const auto closedIt = value.find("closed"); closedIt != value.end()) {
+						openTrade.closed = closedIt->get<int>();
+					}
 				}
 
 				if (!openTrade.asset.empty()) {
@@ -238,25 +261,52 @@ TradeStore loadTrades() {
 	return store;
 }
 
-void saveTrades(const TradeStore &store) {
+/**
+ * Write the store out. Opening the target file directly would truncate it first, so a crash or a full disk in the
+ * middle of the write leaves an empty or half written file behind and the trade to symbol mapping is lost. Write to
+ * a temporary file, flush it and rename it over the target, which is atomic on both Windows and POSIX.
+ * @return false when the store could not be persisted
+ */
+bool saveTrades(const TradeStore &store) {
+	const std::filesystem::path target(OPEN_TRADES_FILE);
+	const auto temporary = std::filesystem::path(target).concat(".tmp");
+
 	try {
 		auto tradesJson = nlohmann::json::object();
 
 		for (const auto &[tradeId, openTrade]: store.open) {
-			tradesJson[std::to_string(tradeId)] = {{"asset", openTrade.asset}, {"lots", openTrade.lots}};
+			tradesJson[std::to_string(tradeId)] = {
+				{"asset", openTrade.asset}, {"lots", openTrade.lots}, {"closed", openTrade.closed}
+			};
 		}
 
 		nlohmann::json json;
 		json["openTrades"] = tradesJson;
-		json["closedTrades"] = store.closed;
+		json["closedTrades"] = store.closed; {
+			std::ofstream ofs(temporary, std::ios::binary | std::ios::trunc);
 
-		if (std::ofstream ofs(OPEN_TRADES_FILE); ofs.is_open()) {
+			if (!ofs.is_open()) {
+				spdlog::error("Couldn't save json file, path: {}, {}", temporary.string(), MAKE_FILELINE);
+				return false;
+			}
+
 			ofs << json.dump(4);
-		} else {
-			spdlog::error("Couldn't save json file, path: {}, {}", OPEN_TRADES_FILE, MAKE_FILELINE);
+			ofs.flush();
+
+			if (!ofs.good()) {
+				spdlog::error("Couldn't write json file, path: {}, {}", temporary.string(), MAKE_FILELINE);
+				return false;
+			}
 		}
+
+		std::filesystem::rename(temporary, target);
+		return true;
 	} catch (std::exception &e) {
 		spdlog::error("{}: {}", MAKE_FILELINE, e.what());
+
+		std::error_code ignored;
+		std::filesystem::remove(temporary, ignored);
+		return false;
 	}
 }
 
@@ -287,19 +337,33 @@ bool wasTradeClosed(const int tradeId) {
 	return std::ranges::find(store.closed, tradeId) != store.closed.end();
 }
 
-void storeOpenTrade(const int tradeId, const std::string &asset, const int lots) {
+bool storeOpenTrade(const int tradeId, const std::string &asset, const int lots) {
 	auto &store = tradeStore();
 	store.open.insert_or_assign(tradeId, OpenTrade{asset, lots});
-	saveTrades(store);
+	return saveTrades(store);
+}
+
+/// Move a finished trade to the capped list of closed ids, which keeps the file from growing and lets BrokerTrade
+/// report a closed trade instead of an unknown one
+void markTradeClosed(TradeStore &store, const std::map<int, OpenTrade>::iterator &it) {
+	const auto tradeId = it->first;
+	store.open.erase(it);
+	store.closed.push_back(tradeId);
+
+	if (store.closed.size() > MAX_CLOSED_TRADES) {
+		store.closed.erase(store.closed.begin(),
+		                   store.closed.begin() + static_cast<long>(store.closed.size() - MAX_CLOSED_TRADES));
+	}
 }
 
 /**
- * Account for lots that have just been closed. Once nothing is left open the record moves to the capped list of
- * closed trades, which both keeps the file from growing forever and lets BrokerTrade report a closed trade.
+ * Account for lots that have just been closed. The record is retired once the closed amount reaches what was
+ * requested; a trade whose entry filled only partially is retired by BrokerTrade, which is the first place that
+ * knows the real entry fill.
  * @param tradeId
  * @param closedLots absolute number of closed lots
  */
-void reduceOpenTrade(const int tradeId, const int closedLots) {
+void bookClosedLots(const int tradeId, const int closedLots) {
 	auto &store = tradeStore();
 	const auto it = store.open.find(tradeId);
 
@@ -307,19 +371,23 @@ void reduceOpenTrade(const int tradeId, const int closedLots) {
 		return;
 	}
 
-	if (const auto remaining = std::abs(it->second.lots) - std::abs(closedLots); remaining > 0) {
-		it->second.lots = it->second.lots < 0 ? -remaining : remaining;
-	} else {
-		store.open.erase(it);
-		store.closed.push_back(tradeId);
+	it->second.closed += std::abs(closedLots);
 
-		if (store.closed.size() > MAX_CLOSED_TRADES) {
-			store.closed.erase(store.closed.begin(),
-			                   store.closed.begin() + static_cast<long>(store.closed.size() - MAX_CLOSED_TRADES));
-		}
+	if (it->second.lots != 0 && it->second.closed >= std::abs(it->second.lots)) {
+		markTradeClosed(store, it);
 	}
 
 	saveTrades(store);
+}
+
+/// Retire a trade whose entry fill turned out to be fully closed already
+void retireOpenTrade(const int tradeId) {
+	auto &store = tradeStore();
+
+	if (const auto it = store.open.find(tradeId); it != store.open.end()) {
+		markTradeClosed(store, it);
+		saveTrades(store);
+	}
 }
 
 DLLFUNC_C int BrokerLogin(char *User, char *Pwd, char *Type, char *Account) {
@@ -562,17 +630,41 @@ DLLFUNC_C int BrokerTime(DATE *pTimeGMT) {
 		return ExchangeStatus::Unavailable;
 	}
 
-#ifdef ENABLE_SERVER_TIME
-	// Off by default to save time, response takes roughly 0.35 s
-	std::int64_t timeInMs = restClient->getServerTime();
+	/// Zorro uses this to notice that the connection broke down, to stop trading and to keep probing until it is
+	/// back. Reporting the market as open just because the client object exists hides every outage.
+	static std::int64_t lastProbeMs = 0;
+	static bool connectionOk = true;
 
-	if (pTimeGMT) {
-		*pTimeGMT = convertTime(timeInMs);
+	const auto nowMs = stonky::getMsTimestamp(stonky::currentTime()).count();
+
+	/// Any recent successful response is proof enough, no need to spend a request on it
+	if (const auto lastSuccessMs = restClient->lastSuccessfulResponseMs();
+		lastSuccessMs > 0 && nowMs - lastSuccessMs < CONNECTION_FRESH_MS) {
+		connectionOk = true;
+		/// Bybit never closes
+		return ExchangeStatus::Open;
 	}
-#endif
 
-	/// Bybit never closes
-	return ExchangeStatus::Open;
+	if (nowMs - lastProbeMs < CONNECTION_PROBE_INTERVAL_MS) {
+		return connectionOk ? ExchangeStatus::Open : ExchangeStatus::Unavailable;
+	}
+
+	lastProbeMs = nowMs;
+
+	try {
+		const auto timeInMs = restClient->getServerTime();
+
+		if (pTimeGMT) {
+			*pTimeGMT = convertTime(timeInMs);
+		}
+
+		connectionOk = true;
+		return ExchangeStatus::Open;
+	} catch (std::exception &e) {
+		spdlog::error("{}: connection probe failed: {}", MAKE_FILELINE, e.what());
+		connectionOk = false;
+		return ExchangeStatus::Unavailable;
+	}
 }
 
 DLLFUNC_C int BrokerHistory2(char *Asset, DATE tStart, DATE tEnd, int nTickMinutes, int nTicks, T6 *ticks) {
@@ -678,6 +770,93 @@ std::optional<OrderResponse> pollOrderState(const std::string &symbol, const Ord
 	return lastState;
 }
 
+/**
+ * Establish what really happened to an order whose send failed with an unknown outcome. Bybit may well have
+ * accepted it, so it must never be reported as a plain rejection.
+ *
+ * Zorro requires the plugin to cancel an order it answers with -2, so an order still resting on the book is
+ * cancelled here and the resulting fill is taken as the truth.
+ *
+ * @return the trade id when the order holds a position, 0 when it never filled, -2 when even the reconciliation
+ *         could not reach the exchange
+ */
+int reconcileUnknownOrder(const std::string &asset, const int tradeId, const int amount, double *pPrice,
+                          int *pFill) {
+	const auto orderLinkId = std::to_string(tradeId);
+
+	try {
+		auto order = restClient->getOpenOrder(Category::linear, asset, "", orderLinkId);
+
+		if (order && order->orderStatus != OrderStatus::Filled && isLiveOrderStatus(order->orderStatus)) {
+			spdlog::warn("{}: order {} is live after an unknown outcome, cancelling it", MAKE_FILELINE, orderLinkId);
+
+			try {
+				static_cast<void>(restClient->cancelOrder(Category::linear, asset, "", orderLinkId));
+			} catch (std::exception &e) {
+				/// It may have filled in the meantime, the re-query below decides
+				spdlog::warn("{}: cancel of {} failed: {}", MAKE_FILELINE, orderLinkId, e.what());
+			}
+
+			order = restClient->getOpenOrder(Category::linear, asset, "", orderLinkId);
+		}
+
+		double filledQty = 0.0;
+		double avgPrice = 0.0;
+
+		if (order) {
+			filledQty = order->cumExecQty;
+			avgPrice = order->avgPrice;
+		} else {
+			/// A cancelled or fully filled order is gone from the realtime endpoint, the fills remain
+			double execValue = 0.0;
+
+			for (const auto &execution: restClient->getExecutions(Category::linear, asset, orderLinkId)) {
+				if (execution.execType != ExecType::Trade) {
+					continue;
+				}
+
+				filledQty += execution.execQty;
+				execValue += execution.execValue;
+			}
+
+			if (filledQty > 0.0) {
+				avgPrice = execValue / filledQty;
+			}
+		}
+
+		if (const auto filledLots = static_cast<int>(std::round(filledQty / lotAmount)); filledLots > 0) {
+			if (pPrice && avgPrice > 0.0) {
+				*pPrice = avgPrice;
+			}
+
+			if (pFill) {
+				*pFill = filledLots;
+			}
+
+			spdlog::warn("{}: order {} was accepted despite the unknown outcome, filled size: {}", MAKE_FILELINE,
+			             orderLinkId, filledLots);
+
+			if (!storeOpenTrade(tradeId, asset, amount)) {
+				BrokerError("Order reconciled but the trade record could not be saved, see the log.");
+			}
+
+			return tradeId;
+		}
+
+		/// The order either never reached the exchange or never filled - nothing was opened
+		spdlog::info("Order " + orderLinkId + " did not fill, nothing was opened");
+		return 0;
+	} catch (const UnknownOutcomeError &e) {
+		/// Still cannot reach the exchange - the order state stays genuinely unknown
+		spdlog::error("{}: reconciliation of {} failed: {}", MAKE_FILELINE, orderLinkId, e.what());
+		BrokerError("Order state unknown, check the exchange for an orphaned order.");
+		return -2;
+	} catch (std::exception &e) {
+		spdlog::info("{}: order {} is not known to the exchange: {}", MAKE_FILELINE, orderLinkId, e.what());
+		return 0;
+	}
+}
+
 DLLFUNC_C int BrokerBuy2(char *Asset, int Amount, double dStopDist, double Limit, double *pPrice, int *pFill) {
 	if (!restClient) {
 		spdlog::critical("{}: {}", MAKE_FILELINE, "Bybit Rest Client instance not initialized.");
@@ -687,6 +866,9 @@ DLLFUNC_C int BrokerBuy2(char *Asset, int Amount, double dStopDist, double Limit
 	if (!Asset || !*Asset || Amount == 0) {
 		return 0;
 	}
+
+	/// Known before the order goes out, so that an unknown outcome can still be reconciled by order link id
+	int tradeId = 0;
 
 	try {
 #ifdef _WIN64
@@ -737,14 +919,16 @@ DLLFUNC_C int BrokerBuy2(char *Asset, int Amount, double dStopDist, double Limit
 
 		/// A non-zero positionIdx on the existing position record means the account is in Hedge mode; One-way mode
 		/// requires positionIdx 0, which is also the safe default when no position record exists yet.
-		if (const auto positionResponse = restClient->getPositionInfo(Category::linear, Asset);
-			!positionResponse.empty() && positionResponse[0].positionIdx != 0) {
+		const auto positionResponse = restClient->getPositionInfo(Category::linear, Asset);
+		hedge = !positionResponse.empty() && positionResponse[0].positionIdx != 0;
+
+		if (hedge) {
 			order.positionIdx = order.side == Side::Buy ? 1 : 2;
 		} else {
 			order.positionIdx = 0;
 		}
 
-		const auto tradeId = std::stoi(order.orderLinkId);
+		tradeId = std::stoi(order.orderLinkId);
 		const auto orderId = restClient->placeOrder(order);
 		const auto orderState = pollOrderState(Asset, orderId);
 
@@ -776,7 +960,13 @@ DLLFUNC_C int BrokerBuy2(char *Asset, int Amount, double dStopDist, double Limit
 			             std::to_string(orderState->cumExecQty / lotAmount) + ", average price: " +
 			             std::to_string(orderState->avgPrice) + ", clientId: " + order.orderLinkId);
 
-			storeOpenTrade(tradeId, Asset, Amount);
+			if (!storeOpenTrade(tradeId, Asset, Amount)) {
+				/// The order is live on the exchange, so the trade id must still be returned - Zorro keeps its own
+				/// record of it. But without the persisted mapping a restart could not close this trade, which the
+				/// operator has to know about.
+				BrokerError("Order placed but the trade record could not be saved, see the log.");
+			}
+
 			return tradeId;
 		}
 
@@ -796,12 +986,17 @@ DLLFUNC_C int BrokerBuy2(char *Asset, int Amount, double dStopDist, double Limit
 				(orderState->rejectReason.empty() ? "" : ", " + orderState->rejectReason);
 		spdlog::error("{}: {}", MAKE_FILELINE, msg);
 		BrokerError(msg.c_str());
-	} catch (const TransportError &e) {
+	} catch (const UnknownOutcomeError &e) {
 		/// The order may well have reached the exchange - reporting a rejection here would risk a duplicate order.
-		/// -2 tells Zorro that the broker did not confirm within the wait time.
 		spdlog::error("{}: {}", MAKE_FILELINE, e.what());
-		BrokerError("No confirmation from server, order state unknown.");
-		return -2;
+
+		if (tradeId == 0) {
+			/// It never got as far as being sent
+			BrokerError("Cannot send order to server.");
+			return 0;
+		}
+
+		return reconcileUnknownOrder(Asset, tradeId, Amount, pPrice, pFill);
 	} catch (std::exception &e) {
 		spdlog::error("{}: {}", MAKE_FILELINE, e.what());
 		BrokerError("Cannot send order to server.");
@@ -867,8 +1062,10 @@ BrokerSell2(int nTradeId, int nAmount, double Limit, double *pClose, double *pCo
 
 		/// Hedge mode closes the leg identified by positionIdx, One-way mode expresses the closing intent through
 		/// reduceOnly, which also prevents an oversized close from flipping the position
-		if (const auto positionResponse = restClient->getPositionInfo(Category::linear, asset);
-			!positionResponse.empty() && positionResponse[0].positionIdx != 0) {
+		const auto positionResponse = restClient->getPositionInfo(Category::linear, asset);
+		hedge = !positionResponse.empty() && positionResponse[0].positionIdx != 0;
+
+		if (hedge) {
 			order.positionIdx = order.side == Side::Buy ? 2 : 1;
 		} else {
 			order.positionIdx = 0;
@@ -903,9 +1100,9 @@ BrokerSell2(int nTradeId, int nAmount, double Limit, double *pClose, double *pCo
 			             std::to_string(orderState->cumExecQty / lotAmount) + ", average price: " +
 			             std::to_string(orderState->avgPrice) + ", clientId: " + order.orderLinkId);
 
-			/// Book the closed lots against the record, it is dropped once nothing is left open
+			/// Book the closed lots against the record, it is retired once nothing is left open
 			if (filledLots > 0) {
-				reduceOpenTrade(nTradeId, filledLots);
+				bookClosedLots(nTradeId, filledLots);
 			}
 
 			/// Zorro keeps addressing the remainder by the original id
@@ -918,7 +1115,7 @@ BrokerSell2(int nTradeId, int nAmount, double Limit, double *pClose, double *pCo
 				(orderState->rejectReason.empty() ? "" : ", " + orderState->rejectReason);
 		spdlog::error("{}: {}", MAKE_FILELINE, msg);
 		BrokerError(msg.c_str());
-	} catch (const TransportError &e) {
+	} catch (const UnknownOutcomeError &e) {
 		/// BrokerSell2 has no return code for "unknown state", so Zorro will retry. A repeated close is bounded by
 		/// the position itself - reduceOnly in One-way mode, the position leg in Hedge mode.
 		spdlog::error("{}: closing order not confirmed, state unknown: {}", MAKE_FILELINE, e.what());
@@ -1002,9 +1199,24 @@ DLLFUNC_C int BrokerTrade(int nTradeId, double *pOpen, double *pClose, double *p
 
 		const auto filledLots = static_cast<int>(std::round(filledQty / lotAmount));
 
-		/// The order carries the size it was opened with, the record carries what is still open after partial
-		/// closes. Legacy records have no size, there the order is the only source of truth.
-		return openTrade->lots != 0 ? std::min(std::abs(openTrade->lots), filledLots) : filledLots;
+		/// What the entry order actually put on the exchange, minus what has been closed since. The requested size
+		/// only caps it - an order for 10 that filled 3 opened 3 lots, not 10.
+		const auto entryLots = openTrade->lots != 0
+			                       ? std::min(std::abs(openTrade->lots), filledLots)
+			                       : filledLots;
+
+		if (const auto openLots = entryLots - openTrade->closed; openLots > 0) {
+			return openLots;
+		}
+
+		if (entryLots > 0) {
+			/// Everything the entry filled has been closed again
+			retireOpenTrade(nTradeId);
+			return -1;
+		}
+
+		/// Still resting on the book, nothing filled yet
+		return 0;
 	} catch (std::exception &e) {
 		spdlog::error("{}: {}", MAKE_FILELINE, e.what());
 	}
@@ -1032,6 +1244,11 @@ DLLFUNC_C double BrokerCommand(int Command, DWORD dwParameter) {
 			/// generous Zorro setting cannot stall the whole asset loop.
 			if (streamManager) {
 				streamManager->setTimeout(std::clamp(waitMs / 1000, 1, STREAM_READ_TIMEOUT_S));
+			}
+
+			/// Zorro's wait time is what the broker is allowed to take, so bound the REST requests by it too
+			if (restClient) {
+				restClient->setRequestTimeout(waitMs);
 			}
 		case GET_WAIT:
 			return waitMs;
@@ -1076,6 +1293,10 @@ DLLFUNC_C double BrokerCommand(int Command, DWORD dwParameter) {
 				}
 			}
 			break;
+		case GET_COMPLIANCE:
+			/// 2 = no hedging. In One-way mode the exchange nets an opposite order against the existing position,
+			/// so Zorro must not open a counter trade and believe it holds two independent positions.
+			return hedge ? 0 : 2;
 		case GET_BROKERZONE:
 			return 0; //return 0 for UTC
 		case GET_MAXREQUESTS:

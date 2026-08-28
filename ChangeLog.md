@@ -5,8 +5,14 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Changed
 
+- `recvWindow` of signed requests lowered from the 60 s maximum to the exchange default of 5 s. With the clock
+  synchronization in place the wide window only meant that a badly delayed order could still be executed.
 - `GET_POSITION` now returns the net open amount in lots, as the broker API requires ("net open amount as in
   BrokerBuy2"). It used to return the raw contract quantity. **Scripts that relied on the old unit must be adapted.**
+- `BrokerBuy2` no longer answers a failed send with a plain "rejected". A failure whose outcome is unknown (the
+  transport, the HTTP 5xx family, and the API codes 10016 / 170007) is reconciled: the order is queried back by its client order id,
+  an order still resting on the book is cancelled - which the broker API requires after answering -2 - and whatever
+  filled is reported as the trade.
 - `BrokerAsset` reports the ask price instead of the last traded price, which is what Zorro expects and what the
   returned spread is relative to.
 - `BrokerBuy2` returns -2 when the exchange did not confirm the order (network, timeout, unresolved state) instead
@@ -15,10 +21,28 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Added
 
+- `GET_COMPLIANCE` returns "no hedging" for One-way accounts, so Zorro nets opposite entries instead of believing it
+  holds two independent positions.
+- `BrokerTime` detects a lost connection: it reports the exchange as unreachable when neither recent traffic nor a
+  probe request succeeds, which is what lets Zorro stop trading and reconnect.
 - `BrokerTrade`, so that Zorro can follow the fill state of orders resting on the book.
 
 ### Fixed
 
+- **A partially filled entry left the trade record wrong.** The record kept the REQUESTED size, so an order for 10
+  lots that filled 3 and was then fully closed still counted 7 lots as open and `BrokerTrade` kept reporting an open
+  position that no longer existed. Closed lots are now counted cumulatively against the real entry fill.
+- The store was written by opening the target file directly, which truncates it first - a crash or a full disk in
+  the middle of the write destroyed the trade to symbol mapping. It is written to a temporary file and renamed over
+  the target now, and a failed write is reported to Zorro instead of only being logged.
+- Blocking socket operations had no bound at all, so a black holed connection could stall the Zorro thread
+  indefinitely. They are now bounded by the `SET_WAIT` time. NOTE: effective on Windows; on POSIX Asio cannot tell a
+  socket timeout from a non-blocking would-block and keeps polling, so bounding it there needs the request path
+  rewritten to async operations.
+- `setCredentials` replaced the HTTP session without synchronization while the background instrument updater was
+  using it - a data race, and the `reset()` before the assignment even left a window with a null session.
+- The position mode is remembered from the position records so that `GET_COMPLIANCE` can report it; Bybit has no
+  account wide query for it and One-way, the venue default, is assumed until an order reveals otherwise.
 - **The plugin did not compile.** Every member access still used the old `m_` prefixed field names that
   bybit-cpp-api dropped.
 - Subscribing an illiquid asset failed. Zorro subscribes an asset by calling `BrokerAsset` with `pPrice == NULL`,
