@@ -27,8 +27,8 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "stonky/bybit/bybit.h"
 
 #define PLUGIN_VERSION    2
-#define PLUGIN_VERSION_STR "1.0.0"
-#define PLUGIN_VERSION_RELEASE_DATE "13-october-2025"
+#define PLUGIN_VERSION_STR "2.0.0"
+#define PLUGIN_VERSION_RELEASE_DATE "29-august-2026"
 #undef min
 
 #define ZORRO_REG_KEY "SOFTWARE\\Zorro"

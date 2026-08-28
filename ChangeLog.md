@@ -1,7 +1,7 @@
 # Changelog
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
-## [Unreleased]
+## [2.0.0](https://github.com/StonkyLab/zorro-bybit-futures-plugin/releases/tag/2.0.0) (2026-08-29)
 
 ### Changed
 
@@ -78,6 +78,11 @@ All notable changes to this project will be documented in this file. This projec
 - The Visual Studio project pointed at `bybit_cpp_api` / `vk_cpp_common`, which no longer exist, listed template
   headers that were never in the repository, did not link zlib although it compiles the zlib using REST client, and
   carried the Binance project's GUID and root namespace.
+
+### Notes
+
+- The plugin API level reported by `BrokerOpen` stays at 2, that is the Zorro broker API generation the plugin
+  implements, not the plugin's own version.
 
 ## [1.0.0](https://github.com/stawe-org/zorro_bybit_plugin/releases/tag/1.0.0) (2025-10-13)
 
