@@ -197,6 +197,10 @@ struct OpenTrade {
 	/// requested size with the filled one: a request for 10 that filled 3 and was then fully closed would still
 	/// leave 7 "open" in the record while the exchange position is flat.
 	int closed{0};
+
+	/// Client ids of closing orders whose outcome could not be established. Closes are sent IOC so they never rest
+	/// on the book, but a lost response still leaves a fill that has to be booked - BrokerTrade retries these.
+	std::vector<int> pendingCloses;
 };
 
 /// Ids of recently closed trades, so that BrokerTrade can tell "fully closed" (-1) apart from "unknown" (NAY)
@@ -243,6 +247,11 @@ TradeStore loadTrades() {
 					if (const auto closedIt = value.find("closed"); closedIt != value.end()) {
 						openTrade.closed = closedIt->get<int>();
 					}
+
+					if (const auto pendingIt = value.find("pendingCloses");
+						pendingIt != value.end() && pendingIt->is_array()) {
+						openTrade.pendingCloses = pendingIt->get<std::vector<int> >();
+					}
 				}
 
 				if (!openTrade.asset.empty()) {
@@ -276,7 +285,8 @@ bool saveTrades(const TradeStore &store) {
 
 		for (const auto &[tradeId, openTrade]: store.open) {
 			tradesJson[std::to_string(tradeId)] = {
-				{"asset", openTrade.asset}, {"lots", openTrade.lots}, {"closed", openTrade.closed}
+				{"asset", openTrade.asset}, {"lots", openTrade.lots}, {"closed", openTrade.closed},
+				{"pendingCloses", openTrade.pendingCloses}
 			};
 		}
 
@@ -378,6 +388,27 @@ void bookClosedLots(const int tradeId, const int closedLots) {
 	}
 
 	saveTrades(store);
+}
+
+/// Remember a closing order whose outcome could not be established, so that BrokerTrade can finish the job
+void rememberPendingClose(const int tradeId, const int closeOrderId) {
+	auto &store = tradeStore();
+
+	if (const auto it = store.open.find(tradeId); it != store.open.end()) {
+		it->second.pendingCloses.push_back(closeOrderId);
+		saveTrades(store);
+	}
+}
+
+/// Drop a closing order from the pending list once its fill has been booked
+void forgetPendingClose(const int tradeId, const int closeOrderId) {
+	auto &store = tradeStore();
+
+	if (const auto it = store.open.find(tradeId); it != store.open.end()) {
+		auto &pending = it->second.pendingCloses;
+		std::erase(pending, closeOrderId);
+		saveTrades(store);
+	}
 }
 
 /// Retire a trade whose entry fill turned out to be fully closed already
@@ -741,6 +772,21 @@ bool isSettledOrderStatus(const OrderStatus status) {
 	}
 }
 
+/// The exchange will not change this order anymore. Distinct from isSettledOrderStatus, which also counts a resting
+/// order as decided.
+bool isTerminalOrderStatus(const OrderStatus status) {
+	switch (status) {
+		case OrderStatus::Filled:
+		case OrderStatus::Cancelled:
+		case OrderStatus::Rejected:
+		case OrderStatus::Deactivated:
+		case OrderStatus::PartiallyFilledCanceled:
+			return true;
+		default:
+			return false;
+	}
+}
+
 /// A resting order (New) is a valid outcome, not a failure - it must be reported to Zorro as a pending trade
 bool isLiveOrderStatus(const OrderStatus status) {
 	return status == OrderStatus::New || status == OrderStatus::PartiallyFilled || status == OrderStatus::Filled ||
@@ -781,80 +827,110 @@ std::optional<OrderResponse> pollOrderState(const std::string &symbol, const Ord
  *         could not reach the exchange
  */
 int reconcileUnknownOrder(const std::string &asset, const int tradeId, const int amount, double *pPrice,
-                          int *pFill) {
-	const auto orderLinkId = std::to_string(tradeId);
+                          int *pFill);
 
-	try {
-		auto order = restClient->getOpenOrder(Category::linear, asset, "", orderLinkId);
+/**
+ * Drive an order to a state the exchange will not change anymore and report what it filled.
+ *
+ * Bybit's cancel is asynchronous - the response only means the request was accepted - so a single query after it can
+ * still answer New. Taking that for "did not fill" would report a live order as rejected. Poll until it settles.
+ *
+ * @param cancelIfLive send a cancel when the order is still working. Zorro requires this before -2 is returned.
+ * @return filled lots once the order is settled, bad option when that could not be established
+ */
+std::optional<int> resolveOrderOutcome(const std::string &asset, const int clientOrderId, const bool cancelIfLive) {
+	const auto orderLinkId = std::to_string(clientOrderId);
+	bool cancelSent = false;
 
-		if (order && order->orderStatus != OrderStatus::Filled && isLiveOrderStatus(order->orderStatus)) {
-			spdlog::warn("{}: order {} is live after an unknown outcome, cancelling it", MAKE_FILELINE, orderLinkId);
+	for (int attempt = 0; attempt < MAX_ORDER_POLL_ATTEMPTS; attempt++) {
+		std::optional<OrderResponse> order;
+
+		try {
+			order = restClient->getOpenOrder(Category::linear, asset, "", orderLinkId);
+		} catch (const OrderNotFound &) {
+			/// The exchange settles the question: it never got the order
+			return 0;
+		} catch (const std::exception &e) {
+			/// Anything else - transport, 5xx, auth, rate limit - says nothing about the order
+			spdlog::warn("{}: query of {} failed: {}", MAKE_FILELINE, orderLinkId, e.what());
+			std::this_thread::sleep_for(ORDER_POLL_INTERVAL);
+			continue;
+		}
+
+		if (!order) {
+			/// Gone from the realtime endpoint: either finished or never placed. The fills are the remaining truth.
+			try {
+				double filledQty = 0.0;
+
+				for (const auto &execution: restClient->getExecutions(Category::linear, asset, orderLinkId)) {
+					if (execution.execType == ExecType::Trade) {
+						filledQty += execution.execQty;
+					}
+				}
+
+				return static_cast<int>(std::round(filledQty / lotAmount));
+			} catch (const std::exception &e) {
+				spdlog::warn("{}: executions of {} failed: {}", MAKE_FILELINE, orderLinkId, e.what());
+				std::this_thread::sleep_for(ORDER_POLL_INTERVAL);
+				continue;
+			}
+		}
+
+		if (isTerminalOrderStatus(order->orderStatus)) {
+			return static_cast<int>(std::round(order->cumExecQty / lotAmount));
+		}
+
+		if (cancelIfLive && !cancelSent) {
+			cancelSent = true;
+			spdlog::warn("{}: order {} is still working, cancelling it", MAKE_FILELINE, orderLinkId);
 
 			try {
 				static_cast<void>(restClient->cancelOrder(Category::linear, asset, "", orderLinkId));
 			} catch (std::exception &e) {
-				/// It may have filled in the meantime, the re-query below decides
+				/// It may have filled in the meantime, the polling decides
 				spdlog::warn("{}: cancel of {} failed: {}", MAKE_FILELINE, orderLinkId, e.what());
 			}
-
-			order = restClient->getOpenOrder(Category::linear, asset, "", orderLinkId);
 		}
 
-		double filledQty = 0.0;
-		double avgPrice = 0.0;
+		std::this_thread::sleep_for(ORDER_POLL_INTERVAL);
+	}
 
-		if (order) {
-			filledQty = order->cumExecQty;
-			avgPrice = order->avgPrice;
-		} else {
-			/// A cancelled or fully filled order is gone from the realtime endpoint, the fills remain
-			double execValue = 0.0;
+	spdlog::error("{}: order {} did not settle, its outcome stays unknown", MAKE_FILELINE, orderLinkId);
+	return {};
+}
 
-			for (const auto &execution: restClient->getExecutions(Category::linear, asset, orderLinkId)) {
-				if (execution.execType != ExecType::Trade) {
-					continue;
-				}
+/**
+ * Establish what really happened to an order whose outcome is unknown. Bybit may well have accepted it, so it must
+ * never be reported as a plain rejection. An order still resting is cancelled, which Zorro requires before -2.
+ *
+ * @return the trade id when the order holds a position, 0 when it never filled, -2 when it could not be settled
+ */
+int reconcileUnknownOrder(const std::string &asset, const int tradeId, const int amount, double *pPrice,
+                          int *pFill) {
+	const auto filledLots = resolveOrderOutcome(asset, tradeId, true);
 
-				filledQty += execution.execQty;
-				execValue += execution.execValue;
-			}
-
-			if (filledQty > 0.0) {
-				avgPrice = execValue / filledQty;
-			}
-		}
-
-		if (const auto filledLots = static_cast<int>(std::round(filledQty / lotAmount)); filledLots > 0) {
-			if (pPrice && avgPrice > 0.0) {
-				*pPrice = avgPrice;
-			}
-
-			if (pFill) {
-				*pFill = filledLots;
-			}
-
-			spdlog::warn("{}: order {} was accepted despite the unknown outcome, filled size: {}", MAKE_FILELINE,
-			             orderLinkId, filledLots);
-
-			if (!storeOpenTrade(tradeId, asset, amount)) {
-				BrokerError("Order reconciled but the trade record could not be saved, see the log.");
-			}
-
-			return tradeId;
-		}
-
-		/// The order either never reached the exchange or never filled - nothing was opened
-		spdlog::info("Order " + orderLinkId + " did not fill, nothing was opened");
-		return 0;
-	} catch (const UnknownOutcomeError &e) {
-		/// Still cannot reach the exchange - the order state stays genuinely unknown
-		spdlog::error("{}: reconciliation of {} failed: {}", MAKE_FILELINE, orderLinkId, e.what());
+	if (!filledLots) {
 		BrokerError("Order state unknown, check the exchange for an orphaned order.");
 		return -2;
-	} catch (std::exception &e) {
-		spdlog::info("{}: order {} is not known to the exchange: {}", MAKE_FILELINE, orderLinkId, e.what());
+	}
+
+	if (*filledLots <= 0) {
+		spdlog::info("Order " + std::to_string(tradeId) + " did not fill, nothing was opened");
 		return 0;
 	}
+
+	if (pFill) {
+		*pFill = *filledLots;
+	}
+
+	spdlog::warn("{}: order {} was accepted despite the unknown outcome, filled size: {}", MAKE_FILELINE, tradeId,
+	             *filledLots);
+
+	if (!storeOpenTrade(tradeId, asset, amount)) {
+		BrokerError("Order reconciled but the trade record could not be saved, see the log.");
+	}
+
+	return tradeId;
 }
 
 DLLFUNC_C int BrokerBuy2(char *Asset, int Amount, double dStopDist, double Limit, double *pPrice, int *pFill) {
@@ -1058,7 +1134,10 @@ BrokerSell2(int nTradeId, int nAmount, double Limit, double *pClose, double *pCo
 		order.orderLinkId = std::to_string(lastOrderId++);
 		writeBybitLastOrderId();
 
-		order.timeInForce = TimeInForce::GTC;
+		/// A close must never rest on the book. Nothing tracks it afterwards, so an order that fills later would
+		/// leave Zorro holding a trade that no longer exists on the exchange. IOC fills what it can right away and
+		/// cancels the rest; a market close is immediate anyway.
+		order.timeInForce = TimeInForce::IOC;
 
 		/// Hedge mode closes the leg identified by positionIdx, One-way mode expresses the closing intent through
 		/// reduceOnly, which also prevents an oversized close from flipping the position
@@ -1072,54 +1151,60 @@ BrokerSell2(int nTradeId, int nAmount, double Limit, double *pClose, double *pCo
 			order.reduceOnly = true;
 		}
 
-		const auto orderId = restClient->placeOrder(order);
-		const auto orderState = pollOrderState(asset, orderId);
+		const auto closeOrderId = std::stoi(order.orderLinkId);
+		std::optional<int> filledLots;
+		double closePrice = 0.0;
 
-		if (!orderState) {
-			spdlog::error("{}: {}", MAKE_FILELINE,
-			              "Closing order state could not be resolved, order may be live on the exchange, "
-			              "orderLinkId: " + order.orderLinkId);
-			BrokerError("No order confirmation from server, close state unknown.");
+		try {
+			const auto orderId = restClient->placeOrder(order);
+
+			if (const auto orderState = pollOrderState(asset, orderId);
+				orderState && isTerminalOrderStatus(orderState->orderStatus)) {
+				filledLots = static_cast<int>(std::round(orderState->cumExecQty / lotAmount));
+				closePrice = orderState->avgPrice;
+			} else {
+				/// Not terminal within the poll budget - settle it instead of guessing
+				filledLots = resolveOrderOutcome(asset, closeOrderId, true);
+			}
+		} catch (const UnknownOutcomeError &e) {
+			/// The close may well have executed - find out instead of guessing
+			spdlog::error("{}: closing order not confirmed, reconciling: {}", MAKE_FILELINE, e.what());
+			filledLots = resolveOrderOutcome(asset, closeOrderId, true);
+		}
+
+		if (!filledLots) {
+			/// The outcome stays unknown. Remember the close order so that BrokerTrade books its fill later, and
+			/// report the trade as not closed - Zorro retries, and reduceOnly keeps a repeat from flipping the
+			/// position.
+			rememberPendingClose(nTradeId, closeOrderId);
+			BrokerError("Close state unknown, it will be reconciled, see the log.");
 			return 0;
 		}
 
-		const auto filledLots = static_cast<int>(std::round(orderState->cumExecQty / lotAmount));
-
-		/// A partial close (IOC leftovers cancelled) still closed real lots and must be booked
-		if (isLiveOrderStatus(orderState->orderStatus) || filledLots > 0) {
+		if (*filledLots > 0) {
 			if (pFill) {
-				*pFill = filledLots;
+				*pFill = *filledLots;
 			}
 
-			if (pClose && orderState->avgPrice > 0.0) {
-				*pClose = orderState->avgPrice;
+			if (pClose && closePrice > 0.0) {
+				*pClose = closePrice;
 			}
 
-			spdlog::info("Closing order placed for asset: " + std::string(asset) + ", status: " +
-			             std::string(magic_enum::enum_name(orderState->orderStatus)) + ", filled size: " +
-			             std::to_string(orderState->cumExecQty / lotAmount) + ", average price: " +
-			             std::to_string(orderState->avgPrice) + ", clientId: " + order.orderLinkId);
+			spdlog::info("Closing order for asset: " + std::string(asset) + ", filled size: " +
+			             std::to_string(*filledLots) + ", average price: " + std::to_string(closePrice) +
+			             ", clientId: " + order.orderLinkId);
 
 			/// Book the closed lots against the record, it is retired once nothing is left open
-			if (filledLots > 0) {
-				bookClosedLots(nTradeId, filledLots);
-			}
+			bookClosedLots(nTradeId, *filledLots);
 
 			/// Zorro keeps addressing the remainder by the original id
 			return nTradeId;
 		}
 
-		const std::string msg =
-				"Cannot place order: " + std::string(asset) + ", size: " + std::to_string(nAmount) +
-				", reason: " + std::string(magic_enum::enum_name(orderState->orderStatus)) +
-				(orderState->rejectReason.empty() ? "" : ", " + orderState->rejectReason);
+		const std::string msg = "Closing order did not fill: " + std::string(asset) + ", size: " +
+		                        std::to_string(nAmount);
 		spdlog::error("{}: {}", MAKE_FILELINE, msg);
 		BrokerError(msg.c_str());
-	} catch (const UnknownOutcomeError &e) {
-		/// BrokerSell2 has no return code for "unknown state", so Zorro will retry. A repeated close is bounded by
-		/// the position itself - reduceOnly in One-way mode, the position leg in Hedge mode.
-		spdlog::error("{}: closing order not confirmed, state unknown: {}", MAKE_FILELINE, e.what());
-		BrokerError("No confirmation from server, close state unknown.");
 	} catch (std::exception &e) {
 		spdlog::error("{}: {}", MAKE_FILELINE, e.what());
 		BrokerError("Cannot close trade.");
@@ -1157,25 +1242,45 @@ DLLFUNC_C int BrokerTrade(int nTradeId, double *pOpen, double *pClose, double *p
 			return NAY;
 		}
 #endif
+		/// A close whose outcome was never established still holds a fill that has to be booked, otherwise this
+		/// trade would keep reporting lots that the exchange no longer has
+		for (const auto closeOrderId: openTrade->pendingCloses) {
+			if (const auto closedLots = resolveOrderOutcome(openTrade->asset, closeOrderId, true)) {
+				spdlog::info("Pending close " + std::to_string(closeOrderId) + " settled, filled size: " +
+				             std::to_string(*closedLots));
+
+				if (*closedLots > 0) {
+					bookClosedLots(nTradeId, *closedLots);
+				}
+
+				forgetPendingClose(nTradeId, closeOrderId);
+			}
+		}
+
+		/// bookClosedLots may have retired the trade, so re-read the record
+		const auto currentTrade = findOpenTrade(nTradeId);
+
+		if (!currentTrade) {
+			return wasTradeClosed(nTradeId) ? -1 : NAY;
+		}
+
 		const auto orderLinkId = std::to_string(nTradeId);
 		double filledQty = 0.0;
 		double avgPrice = 0.0;
+		bool orderGone = false;
 
-		if (const auto order = restClient->getOpenOrder(Category::linear, openTrade->asset, "", orderLinkId)) {
-			if (!isLiveOrderStatus(order->orderStatus)) {
-				/// Cancelled, Rejected, Deactivated - anything filled before is a real position
-				const auto lots = static_cast<int>(std::round(order->cumExecQty / lotAmount));
-				return lots > 0 ? lots : NAY - 1;
-			}
-
+		if (const auto order = restClient->getOpenOrder(Category::linear, currentTrade->asset, "", orderLinkId)) {
 			filledQty = order->cumExecQty;
 			avgPrice = order->avgPrice;
+			/// Cancelled, Rejected, Deactivated, Filled - the exchange will not add to it anymore
+			orderGone = isTerminalOrderStatus(order->orderStatus);
 		} else {
 			/// Bybit's realtime order endpoint only serves orders that are still open. A fully filled order is
 			/// gone from it, so the fills themselves are the remaining source of truth.
 			double execValue = 0.0;
 
-			for (const auto &execution: restClient->getExecutions(Category::linear, openTrade->asset, orderLinkId)) {
+			for (const auto &execution: restClient->getExecutions(Category::linear, currentTrade->asset,
+			                                                     orderLinkId)) {
 				if (execution.execType != ExecType::Trade) {
 					/// Funding and the like share this topic, they are not fills
 					continue;
@@ -1185,12 +1290,11 @@ DLLFUNC_C int BrokerTrade(int nTradeId, double *pOpen, double *pClose, double *p
 				execValue += execution.execValue;
 			}
 
-			if (filledQty <= 0.0) {
-				/// Neither open nor ever filled - the order is gone from the broker
-				return NAY - 1;
-			}
+			orderGone = true;
 
-			avgPrice = execValue / filledQty;
+			if (filledQty > 0.0) {
+				avgPrice = execValue / filledQty;
+			}
 		}
 
 		if (pOpen && avgPrice > 0.0) {
@@ -1201,18 +1305,18 @@ DLLFUNC_C int BrokerTrade(int nTradeId, double *pOpen, double *pClose, double *p
 
 		/// What the entry order actually put on the exchange, minus what has been closed since. The requested size
 		/// only caps it - an order for 10 that filled 3 opened 3 lots, not 10.
-		const auto entryLots = openTrade->lots != 0
-			                       ? std::min(std::abs(openTrade->lots), filledLots)
+		const auto entryLots = currentTrade->lots != 0
+			                       ? std::min(std::abs(currentTrade->lots), filledLots)
 			                       : filledLots;
 
-		if (const auto openLots = entryLots - openTrade->closed; openLots > 0) {
+		if (const auto openLots = entryLots - currentTrade->closed; openLots > 0) {
 			return openLots;
 		}
 
-		if (entryLots > 0) {
-			/// Everything the entry filled has been closed again
+		if (entryLots > 0 || orderGone) {
+			/// Everything the entry filled has been closed again, or the order is gone without a fill
 			retireOpenTrade(nTradeId);
-			return -1;
+			return entryLots > 0 ? -1 : NAY - 1;
 		}
 
 		/// Still resting on the book, nothing filled yet

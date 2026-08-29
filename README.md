@@ -14,10 +14,13 @@ Bybit Futures Plugin for Zorro Trader
 - Both **Hedge** and **One-way** position modes are supported. The mode is detected per symbol from the position
   record; One-way closes are sent as `reduceOnly`.
 - **Demo mode is not supported**, the plugin refuses to log in with `Type == "Demo"`.
-- The account currency defaults to `USDT` when Zorro passes no account name, and is looked up in the **UNIFIED**
-  account.
-- A limit order that rests on the book is reported to Zorro as a pending trade with a fill amount of 0, `BrokerTrade`
-  then reports the fill state. Bybit's realtime order endpoint only serves orders that are still open, so for an
+- **The `Account` field is read as the margin asset, not as an account id.** Zorro passes the account name or
+  number from its account list, this plugin interprets it as the coin whose wallet balance is reported (`USDT` when
+  the field is empty). Leave it empty or set it to the margin asset; an arbitrary account identifier there makes
+  `BrokerAccount` fail with "Account currency not found".
+- A limit ENTRY order that rests on the book is reported to Zorro as a pending trade with a fill amount of 0;
+  `BrokerTrade` then reports its fill state. **Closing orders are always sent IOC**, so they never rest on the
+  book - a close that could be left hanging would keep filling with nothing tracking it. Bybit's realtime order endpoint only serves orders that are still open, so for an
   order that already filled `BrokerTrade` falls back to the execution list - budget one to two REST calls per poll.
 - Prices come from the `tickers` WebSocket stream. Because that stream only pushes when something changes, the plugin
   seeds and refreshes them from the REST ticker endpoint, which keeps illiquid symbols usable.

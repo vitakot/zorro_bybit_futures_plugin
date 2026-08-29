@@ -78,6 +78,27 @@ All notable changes to this project will be documented in this file. This projec
 - The Visual Studio project pointed at `bybit_cpp_api` / `vk_cpp_common`, which no longer exist, listed template
   headers that were never in the repository, did not link zlib although it compiles the zlib using REST client, and
   carried the Binance project's GUID and root namespace.
+- **A closing order could leave Zorro holding a trade that no longer exists.** A GTC limit close rested on the book,
+  nothing tracked it afterwards, and a fill that arrived later was never booked - `BrokerTrade` kept reporting the
+  entry fill as open. Closes are sent IOC now, so they always reach a terminal state before the call returns, and a
+  close whose outcome could not be established is remembered and settled by `BrokerTrade`.
+- **Reconciliation of an unknown outcome could report a live order as rejected.** Cancelling is asynchronous, so the
+  single query after the cancel could still answer "working" with nothing filled, which was taken for "did not
+  fill". The order is now polled until the exchange settles it, and an order that does not settle is reported as
+  unknown (-2), never as a rejection.
+- **Any error during reconciliation was read as "the order does not exist".** An authentication failure, a rate
+  limit or a malformed answer says nothing about the order. Only the venue's own "order does not exist" (Binance
+  -2013, Bybit 110001/170213) settles it now, through a dedicated `OrderNotFound` exception; everything else keeps
+  the outcome unknown.
+- **Bybit `BrokerTrade` ignored the closed lots for a terminal entry order.** An IOC entry that filled partially and
+  was then fully closed still reported the original fill as open, because the terminal branch returned early and
+  skipped the `entry fill - closed` calculation.
+- Bybit no longer answers -2 for an order whose state the poll budget could not resolve without first trying to
+  cancel it, which the broker API requires.
+- Binance HTTP 408 is treated as an unknown outcome as well - it is a timeout waiting for the backend, so the
+  request may have reached it.
+- `stonky_common` is linked `PUBLIC`, so its include directories reach every consumer. Without it a clean CMake
+  configure with `ENABLE_TESTS=ON` failed to build the test executables.
 
 ### Notes
 
