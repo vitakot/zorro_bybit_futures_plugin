@@ -848,7 +848,17 @@ std::optional<OrderOutcome> resolveOrderOutcome(const std::string &asset, const 
                                                 const bool cancelIfLive) {
 	const auto orderLinkId = std::to_string(clientOrderId);
 	bool cancelSent = false;
-	bool cancelAccepted = false;
+
+	/// Where a finished order lands. The realtime endpoint only serves working orders, so this is what carries the
+	/// terminal state once the order is done - an empty realtime answer says nothing on its own.
+	const auto readHistory = [&asset, &orderLinkId]() -> std::optional<OrderResponse> {
+		try {
+			return restClient->getOrderHistory(Category::linear, asset, "", orderLinkId);
+		} catch (const std::exception &e) {
+			spdlog::warn("{}: order history of {} failed: {}", MAKE_FILELINE, orderLinkId, e.what());
+			return {};
+		}
+	};
 
 	/// Sum the fills of one order. Bybit keeps them after the order itself is gone from the realtime endpoint.
 	const auto readExecutions = [&asset, &orderLinkId]() -> std::optional<OrderOutcome> {
@@ -891,7 +901,15 @@ std::optional<OrderOutcome> resolveOrderOutcome(const std::string &asset, const 
 		if (!order) {
 			/// Gone from the realtime endpoint. That is NOT proof of anything on its own: the order may have
 			/// finished, may never have been accepted, or may simply not be visible yet - Bybit warns the endpoint
-			/// can lag. Only a fill settles it; an empty execution list does not.
+			/// can lag. The order history is where a finished order carries its terminal state.
+			if (const auto historic = readHistory(); historic && isTerminalOrderStatus(historic->orderStatus)) {
+				return OrderOutcome{
+					static_cast<int>(std::round(historic->cumExecQty / lotAmount)), historic->avgPrice
+				};
+			}
+
+			/// Not settled by the history either. A fill still proves the order exists and holds a position, and
+			/// recording that is safer than losing it - the caller keeps following it from the trade record.
 			if (const auto outcome = readExecutions(); outcome && outcome->lots > 0) {
 				return outcome;
 			}
@@ -903,8 +921,6 @@ std::optional<OrderOutcome> resolveOrderOutcome(const std::string &asset, const 
 
 				try {
 					static_cast<void>(restClient->cancelOrder(Category::linear, asset, "", orderLinkId));
-					/// Accepted, so the order did exist and is on its way out
-					cancelAccepted = true;
 				} catch (const OrderNotFound &) {
 					return OrderOutcome{};
 				} catch (const std::exception &e) {
@@ -926,7 +942,6 @@ std::optional<OrderOutcome> resolveOrderOutcome(const std::string &asset, const 
 
 			try {
 				static_cast<void>(restClient->cancelOrder(Category::linear, asset, "", orderLinkId));
-				cancelAccepted = true;
 			} catch (std::exception &e) {
 				/// It may have filled in the meantime, the polling decides
 				spdlog::warn("{}: cancel of {} failed: {}", MAKE_FILELINE, orderLinkId, e.what());
@@ -936,14 +951,9 @@ std::optional<OrderOutcome> resolveOrderOutcome(const std::string &asset, const 
 		std::this_thread::sleep_for(ORDER_POLL_INTERVAL);
 	}
 
-	if (cancelAccepted) {
-		/// The venue took the cancel, so the order is not working anymore even if the endpoints still lag behind.
-		/// Whatever the executions hold is final.
-		if (const auto outcome = readExecutions()) {
-			return outcome;
-		}
-	}
-
+	/// An accepted cancel request is NOT a terminal state - Bybit only acknowledges that it took the request, and
+	/// the order can still fill while the cancellation is processed. Without an observed terminal state the outcome
+	/// stays unknown, and the caller answers -2 rather than inventing a "did not fill".
 	spdlog::error("{}: order {} did not settle, its outcome stays unknown", MAKE_FILELINE, orderLinkId);
 	return {};
 }

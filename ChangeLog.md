@@ -115,6 +115,17 @@ All notable changes to this project will be documented in this file. This projec
   terminal state, or when a cancel probe is answered with "order does not exist"; otherwise the outcome stays
   unknown.
 
+- **An accepted cancel request was treated as a terminal state.** Bybit only acknowledges that it took the request;
+  the cancellation is processed asynchronously and the order can still fill meanwhile. After the poll budget the
+  resolver returned the current (often empty) execution list as the final outcome, so a live order could be reported
+  as "did not fill" - and a pending close was dropped from the record on the same basis. Without an observed
+  terminal state the outcome now stays unknown and the caller answers -2.
+- The order history is consulted when the realtime endpoint does not list the order. That endpoint only serves
+  working orders, so it is where a finished order carries its terminal state; relying on the execution list alone
+  could not tell "finished" from "not visible yet".
+- `getExecutions()` follows `nextPageCursor` and asks for pages of 100. It read only the first page before, so an
+  order that filled in more than 50 pieces would have had its fill understated during reconciliation.
+
 ### Notes
 
 - The plugin API level reported by `BrokerOpen` stays at 2, that is the Zorro broker API generation the plugin
