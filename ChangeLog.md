@@ -100,6 +100,21 @@ All notable changes to this project will be documented in this file. This projec
 - `stonky_common` is linked `PUBLIC`, so its include directories reach every consumer. Without it a clean CMake
   configure with `ENABLE_TESTS=ON` failed to build the test executables.
 
+- **A closing order is no longer retried while an earlier one is unresolved.** `BrokerSell2` now settles every
+  pending close of the trade before sending a new one, and refuses to send anything while one stays unknown. A
+  retry would have been a second reduce-only order against the aggregated exchange position, whose fill would be
+  booked against this trade although it may have closed lots belonging to another one.
+- The reconciled fill no longer loses its price: the resolver returns the average fill price along with the lots,
+  so `pPrice` and `pClose` are filled in the timeout paths as well.
+- **`BrokerBuy2` could still answer -2 without ever attempting a cancel**, in both of its unresolved paths. The fix
+  claimed for this in the previous round was lost before it was committed; both paths go through the reconciliation
+  now.
+- **An empty answer from the realtime order endpoint was taken as proof.** Bybit only serves working orders there
+  and warns the endpoint can lag, so "not listed and no fills yet" was read as "never filled" and reported as a
+  plain rejection while the order could be live. It is proof only when a fill exists, when the order reaches a
+  terminal state, or when a cancel probe is answered with "order does not exist"; otherwise the outcome stays
+  unknown.
+
 ### Notes
 
 - The plugin API level reported by `BrokerOpen` stays at 2, that is the Zorro broker API generation the plugin
